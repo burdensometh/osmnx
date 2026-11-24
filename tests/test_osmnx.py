@@ -17,6 +17,7 @@ import os
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 import geopandas as gpd
 import networkx as nx
@@ -645,6 +646,12 @@ def test_routing() -> None:
     G = ox.add_edge_speeds(G, hwy_speeds={"motorway": 100})
     G = ox.add_edge_travel_times(G)
 
+    # every edge is labeled with the source tier its speed came from, and the
+    # tier carries through to the travel time
+    sources = {d["speed_source"] for _, _, _, d in G.edges(keys=True, data=True)}
+    assert sources.issubset({"observed", "group", "default"})
+    assert all("travel_time_source" in d for _, _, _, d in G.edges(keys=True, data=True))
+
     # test value cleaning
     assert ox.routing._clean_maxspeed("5") == 5.0
     assert ox.routing._clean_maxspeed("5 mph") == pytest.approx(8.0467)
@@ -713,6 +720,155 @@ def test_routing() -> None:
     # test great circle and euclidean distance calculators
     assert ox.distance.great_circle(0, 0, 1, 1) == pytest.approx(157249.6034105)
     assert ox.distance.euclidean(0, 0, 1, 1) == pytest.approx(1.4142135)
+
+
+def _speed_test_graph() -> nx.MultiDiGraph:
+    """Build a small offline graph with observed and missing speed values."""
+    G = nx.MultiDiGraph(crs="epsg:4326")
+    for n in range(8):
+        G.add_node(n, x=-122.4 + n * 1e-4, y=37.79 + n * 1e-4, street_count=1)
+    # residential: two observed values, one missing
+    G.add_edge(0, 1, key=0, highway="residential", maxspeed="30", length=100.0)
+    G.add_edge(1, 2, key=0, highway="residential", maxspeed="40", length=100.0)
+    G.add_edge(2, 3, key=0, highway="residential", maxspeed=None, length=100.0)
+    # primary: one observed value (an outlier), two missing
+    G.add_edge(3, 4, key=0, highway="primary", maxspeed="120", length=100.0)
+    G.add_edge(4, 5, key=0, highway="primary", maxspeed=None, length=100.0)
+    G.add_edge(5, 6, key=0, highway="primary", maxspeed=None, length=100.0)
+    # service: no observed values anywhere
+    G.add_edge(6, 7, key=0, highway="service", maxspeed=None, length=100.0)
+    return G
+
+
+def _edges_by_highway(G: nx.MultiDiGraph) -> dict[str, list[dict[str, Any]]]:
+    """Collect edge data dicts grouped by highway type."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for _, _, _, d in G.edges(keys=True, data=True):
+        out.setdefault(d["highway"], []).append(d)
+    return out
+
+
+@pytest.mark.xdist_group(name="group0")
+def test_edge_speed_sources() -> None:
+    """Test tiered speed imputation and its per-edge provenance."""
+    # legacy behavior: each highway type is its own group, observed values win,
+    # and missing values are imputed from the same type's observations
+    G = ox.add_edge_speeds(_speed_test_graph())
+    by_hwy = _edges_by_highway(G)
+    assert [d["speed_source"] for d in by_hwy["residential"]] == [
+        "observed",
+        "observed",
+        "group",
+    ]
+    assert by_hwy["residential"][2]["speed_kph"] == pytest.approx(35.0)
+    assert [d["speed_source"] for d in by_hwy["primary"]] == ["observed", "group", "group"]
+    assert by_hwy["primary"][1]["speed_kph"] == pytest.approx(120.0)
+    # service has no observations so it takes the global default
+    assert by_hwy["service"][0]["speed_source"] == "default"
+
+    # grouping borrows evidence across similar highway types
+    G = ox.add_edge_speeds(
+        _speed_test_graph(),
+        hwy_groups={"majors": ["primary", "residential"], "minor": ["service"]},
+        min_samples=2,
+        agg=np.median,
+    )
+    by_hwy = _edges_by_highway(G)
+    # the majors group has 3 observations and its median is 40. the lone 120
+    # outlier does not distort the median, so primary's missing edges get 40
+    assert by_hwy["primary"][0]["speed_kph"] == pytest.approx(120.0)
+    assert by_hwy["primary"][1]["speed_kph"] == pytest.approx(40.0)
+    assert by_hwy["primary"][2]["speed_kph"] == pytest.approx(40.0)
+    assert by_hwy["residential"][2]["speed_source"] == "group"
+    assert by_hwy["primary"][1]["speed_source"] == "group"
+    # the minor group has no observations and no fallback, so it uses the
+    # global default
+    assert by_hwy["service"][0]["speed_source"] == "default"
+
+    # a group below the minimum sample threshold is not trusted, so its edges
+    # use the declared fallback instead
+    G = ox.add_edge_speeds(
+        _speed_test_graph(),
+        hwy_groups={"majors": ["primary", "residential"]},
+        min_samples=10,
+        fallback=25.0,
+    )
+    by_hwy = _edges_by_highway(G)
+    assert by_hwy["residential"][2]["speed_kph"] == pytest.approx(25.0)
+    assert by_hwy["residential"][2]["speed_source"] == "default"
+    assert by_hwy["primary"][1]["speed_source"] == "default"
+
+    # an explicit hwy_speeds override wins over a group estimate that would
+    # otherwise fill the edge
+    G = ox.add_edge_speeds(
+        _speed_test_graph(),
+        hwy_speeds={"primary": 55.0},
+        hwy_groups={"majors": ["primary", "residential"]},
+        min_samples=2,
+    )
+    by_hwy = _edges_by_highway(G)
+    # the majors group estimate would be 40, but the declared 55 wins
+    assert by_hwy["primary"][1]["speed_kph"] == pytest.approx(55.0)
+    assert by_hwy["primary"][1]["speed_source"] == "default"
+    # residential is not declared, so it still takes the group estimate
+    assert by_hwy["residential"][2]["speed_source"] == "group"
+
+    # an explicit hwy_speeds value fills an edge whose own speed is missing, but
+    # a genuine observed value on another edge is still preserved
+    G = ox.add_edge_speeds(_speed_test_graph(), hwy_speeds={"primary": 55.0})
+    by_hwy = _edges_by_highway(G)
+    assert [d["speed_kph"] for d in by_hwy["primary"]] == [120.0, 55.0, 55.0]
+    assert [d["speed_source"] for d in by_hwy["primary"]] == ["observed", "default", "default"]
+
+    # extreme values follow the declared aggregation strategy. a group of
+    # observed values with one extreme outlier yields different estimates under
+    # mean and median, and the strategy governs which one is imputed
+    def _outlier_graph() -> nx.MultiDiGraph:
+        G = nx.MultiDiGraph(crs="epsg:4326")
+        for n in range(5):
+            G.add_node(n, x=-122.4 + n * 1e-4, y=37.79 + n * 1e-4, street_count=1)
+        G.add_edge(0, 1, key=0, highway="primary", maxspeed="30", length=100.0)
+        G.add_edge(1, 2, key=0, highway="primary", maxspeed="40", length=100.0)
+        G.add_edge(2, 3, key=0, highway="primary", maxspeed="1000", length=100.0)
+        G.add_edge(3, 4, key=0, highway="primary", maxspeed=None, length=100.0)
+        return G
+
+    mean_edges = _edges_by_highway(ox.add_edge_speeds(_outlier_graph()))["primary"]
+    median_edges = _edges_by_highway(
+        ox.add_edge_speeds(_outlier_graph(), agg=np.median)
+    )["primary"]
+    assert mean_edges[-1]["speed_kph"] == pytest.approx((30 + 40 + 1000) / 3)
+    assert median_edges[-1]["speed_kph"] == pytest.approx(40.0)
+    assert mean_edges[-1]["speed_source"] == median_edges[-1]["speed_source"] == "group"
+
+    # travel times record the same provenance as their speeds
+    G = ox.add_edge_travel_times(ox.add_edge_speeds(_speed_test_graph()))
+    for _, _, _, d in G.edges(keys=True, data=True):
+        assert d["travel_time_source"] == d["speed_source"]
+        assert d["travel_time"] > 0
+
+    # invalid arguments raise clear errors
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        ox.add_edge_speeds(_speed_test_graph(), min_samples=0)
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        ox.add_edge_speeds(_speed_test_graph(), min_samples=True)
+    with pytest.raises(ValueError, match="appears in multiple groups"):
+        ox.add_edge_speeds(
+            _speed_test_graph(),
+            hwy_groups={"a": ["primary"], "b": ["primary", "residential"]},
+        )
+    with pytest.raises(ValueError, match="at least one highway type"):
+        ox.add_edge_speeds(_speed_test_graph(), hwy_groups={"a": []})
+    with pytest.raises(TypeError, match="must be strings"):
+        ox.add_edge_speeds(_speed_test_graph(), hwy_groups={"a": [1]})
+
+    # a graph with no speed evidence at all still raises the legacy error
+    G = nx.MultiDiGraph(crs="epsg:4326")
+    G.add_node(0, x=0, y=0, street_count=1)
+    G.add_node(1, x=1, y=1, street_count=1)
+    G.add_edge(0, 1, key=0, highway="residential", length=1.0)
+    with pytest.raises(ValueError, match="no preexisting 'maxspeed'"):
+        ox.add_edge_speeds(G)
 
 
 @pytest.mark.xdist_group(name="group1")

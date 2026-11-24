@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.3.0 (Unreleased)
+
+- add tiered edge speed imputation by road-type group and minimum sample threshold, with a per-edge `speed_source` attribute recording whether each edge's speed came from an observed value, a group estimate, or a default, and a `travel_time_source` attribute propagated to travel times
+
 ## 2.2.0 (2026-11-18)
 
 - add Python 3.15 support and drop Python 3.11 support (#1416)

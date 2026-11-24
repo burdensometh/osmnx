@@ -24,6 +24,13 @@ from . import utils
 if TYPE_CHECKING:
     import geopandas as gpd
 
+# Values used by `add_edge_speeds` to label each edge with the tier its speed
+# estimate came from: its own observed maxspeed, a group-level aggregate, or a
+# declared default value.
+_SPEED_SOURCE_OBSERVED = "observed"
+_SPEED_SOURCE_GROUP = "group"
+_SPEED_SOURCE_DEFAULT = "default"
+
 # Dict that is used by `add_edge_speeds` to convert implicit values
 # to numbers, based on https://wiki.openstreetmap.org/wiki/Key:maxspeed
 _IMPLICIT_MAXSPEEDS: dict[str, float] = {
@@ -458,6 +465,8 @@ def add_edge_speeds(
     G: nx.MultiDiGraph,
     *,
     hwy_speeds: dict[str, float] | None = None,
+    hwy_groups: dict[str, Iterable[str]] | None = None,
+    min_samples: int = 1,
     fallback: float | None = None,
     agg: Callable[[Any], Any] = np.mean,
 ) -> nx.MultiDiGraph:
@@ -474,6 +483,30 @@ def add_edge_speeds(
     correspond to local speed limit standards. The user can also specify a
     different aggregation function (such as the median) to impute missing
     values from the observed values.
+
+    Speed estimates come from one of three sources: 1) the edge's own observed
+    `maxspeed` value, if present (marked `"observed"`); 2) a group estimate,
+    aggregated from the observed speeds of all edges in the edge's road-type
+    group, if that group has at least `min_samples` observed values (marked
+    `"group"`); or 3) a default value (marked `"default"`). The default value
+    is the edge's highway type entry in `hwy_speeds`, if declared, otherwise
+    `fallback`, otherwise a global aggregate of the type-level speeds. An
+    explicit per-highway-type speed in `hwy_speeds` is a user override for
+    edges missing speed data, so it is applied before a group estimate. The
+    source used for each edge is recorded in its new `speed_source` edge
+    attribute, so callers can distinguish imputed values from measured ones
+    instead of letting a single default fill mask the evidence.
+
+    Pass `hwy_groups` to group similar highway types together (for example,
+    `{"motorway": ["motorway", "motorway_link"]}`) so that a sparsely observed
+    highway type can borrow evidence from its better-observed group members.
+    If `hwy_groups` is None, each highway type is its own group, which
+    reproduces the legacy per-highway-type behavior. Any highway type in the
+    graph that is not assigned to a group is likewise treated as its own
+    group. The group estimate is computed by applying `agg` to the group's
+    observed speeds, so extreme values are handled according to the declared
+    aggregation strategy (for example, a median is robust to outliers while a
+    mean is not).
 
     If edge `maxspeed` attribute has "mph" in it, value will automatically be
     converted from miles per hour to km per hour. Any other speed units should
@@ -494,8 +527,19 @@ def add_edge_speeds(
         Dict keys are OSM highway types and values are typical speeds (km per
         hour) to assign to edges of that highway type for any edges missing
         speed data. Any edges with highway type not in `hwy_speeds` will be
-        assigned the mean pre-existing speed value of all edges of that
-        highway type.
+        assigned the group estimate (or `fallback`) described above.
+    hwy_groups
+        Dict keys are road-type group names and values are iterables of the
+        OSM highway types belonging to that group. A group estimate is the
+        aggregated observed speed across all edges whose highway type belongs
+        to the group. Each highway type may belong to at most one group. If
+        None, each highway type is treated as its own group.
+    min_samples
+        Minimum number of observed speed values a group must have before its
+        estimate is trusted. Groups with fewer observations are ignored and
+        their edges fall back to the default value. Must be a positive
+        integer. Default is 1, which trusts any group with at least one
+        observation.
     fallback
         Default speed value (km per hour) to assign to edges whose highway
         type did not appear in `hwy_speeds` and had no pre-existing speed
@@ -508,10 +552,36 @@ def add_edge_speeds(
     Returns
     -------
     G
-        Graph with `speed_kph` attributes on all edges.
+        Graph with `speed_kph` and `speed_source` attributes on all edges.
+
+    Raises
+    ------
+    ValueError
+        If `min_samples` is not a positive integer, if a highway type appears
+        in more than one group in `hwy_groups`, if a group is empty, or if the
+        graph's edges have no pre-existing speed values and neither
+        `hwy_speeds` nor `fallback` was passed.
+    TypeError
+        If `hwy_groups` is not a dict or one of its groups contains a
+        non-string highway type.
     """
     if fallback is None:
         fallback = np.nan
+
+    # validate and normalize min_samples, rejecting booleans and non-integral
+    # values with a clear message rather than a downstream comparison error
+    if isinstance(min_samples, bool):
+        msg = f"`min_samples` must be a positive integer, got {min_samples!r}."
+        raise ValueError(msg)
+    try:
+        min_samples_int = int(min_samples)
+    except (TypeError, ValueError) as err:
+        msg = f"`min_samples` must be a positive integer, got {min_samples!r}."
+        raise ValueError(msg) from err
+    if min_samples_int != min_samples or min_samples_int < 1:
+        msg = f"`min_samples` must be a positive integer, got {min_samples!r}."
+        raise ValueError(msg)
+    min_samples = min_samples_int
 
     edges = convert.graph_to_gdfs(G, nodes=False, fill_edge_geometry=False)
 
@@ -519,43 +589,35 @@ def add_edge_speeds(
     # into string values simply by keeping just the first element of the list
     edges["highway"] = edges["highway"].map(lambda x: x[0] if isinstance(x, list) else x)
 
-    if "maxspeed" in edges.columns:
-        # collapse any maxspeed lists (can happen during graph simplification)
-        # into a single value
-        edges["maxspeed"] = edges["maxspeed"].apply(_collapse_multiple_maxspeed_values, agg=agg)
+    # clean each edge's observed maxspeed into a numeric speed in kph, leaving
+    # missing or unparseable values as null
+    edges["speed_kph"] = _clean_edge_maxspeeds(edges, agg)
 
-        # create speed_kph by cleaning maxspeed strings and converting mph to
-        # kph if necessary
-        edges["speed_kph"] = edges["maxspeed"].astype(str).map(_clean_maxspeed).astype(float)
-    else:
-        # if no edges in graph had a maxspeed attribute
-        edges["speed_kph"] = None
+    # map each highway type to its predefined road-type group
+    highway_to_group = _build_highway_to_group(edges["highway"], hwy_groups)
+    edges["_speed_group"] = edges["highway"].map(highway_to_group)
 
-    # if user provided hwy_speeds, use them as default values, otherwise
-    # initialize an empty series to populate with values
-    hwy_speed_avg = (
+    # aggregate observed speeds within each group, but only trust an estimate
+    # if its group has at least min_samples observations
+    group_estimate = _aggregate_group_speeds(edges, min_samples, agg)
+    edges["_group_speed"] = edges["_speed_group"].map(group_estimate)
+
+    # declared per-highway-type default speeds, dropping nulls
+    declared = (
         pd.Series(dtype=float)
         if hwy_speeds is None
         else pd.Series(hwy_speeds, dtype=float).dropna()
     )
 
-    # for each highway type that caller did not provide in hwy_speeds, impute
-    # speed of type by taking the mean of the preexisting speed values of that
-    # highway type
-    for hwy, group in edges.groupby("highway"):
-        if hwy not in hwy_speed_avg:
-            hwy_speed_avg.loc[hwy] = agg(group["speed_kph"])
+    # compute the last-resort default value
+    global_default = _global_default_speed(edges, declared, fallback, agg)
 
-    # if any highway types had no preexisting speed values, impute their speed
-    # with fallback value provided by caller. if fallback=np.nan, impute speed
-    # as the mean speed of all highway types that did have preexisting values
-    hwy_speed_avg = hwy_speed_avg.fillna(fallback).fillna(agg(hwy_speed_avg))
-
-    # for each edge missing speed data, assign it the imputed value for its
-    # highway type
-    speed_kph = (
-        edges[["highway", "speed_kph"]].set_index("highway").iloc[:, 0].fillna(hwy_speed_avg)
+    # assemble each edge's speed and the source it came from
+    speed_kph, speed_source = _select_edge_speeds(
+        edges["speed_kph"], edges["_group_speed"], edges["highway"].map(declared), global_default
     )
+    edges["speed_kph"] = speed_kph
+    edges["speed_source"] = speed_source
 
     # all speeds will be null if edges had no preexisting maxspeed data and
     # caller did not pass in hwy_speeds or fallback arguments
@@ -566,11 +628,277 @@ def add_edge_speeds(
         )
         raise ValueError(msg)
 
-    # add speed kph attribute to graph edges
-    edges["speed_kph"] = speed_kph.to_numpy()
+    # log how much of the evidence each source supplied
+    counts = speed_source.value_counts()
+    msg = (
+        f"Imputed edge speeds from {counts.get(_SPEED_SOURCE_OBSERVED, 0)} "
+        f"observed values, {counts.get(_SPEED_SOURCE_GROUP, 0)} group estimates, "
+        f"and {counts.get(_SPEED_SOURCE_DEFAULT, 0)} default values"
+    )
+    utils.log(msg, level=lg.INFO)
+
+    # add speed kph and provenance attributes to graph edges
     nx.set_edge_attributes(G, values=edges["speed_kph"].to_dict(), name="speed_kph")
+    nx.set_edge_attributes(G, values=speed_source.to_dict(), name="speed_source")
 
     return G
+
+
+def _clean_edge_maxspeeds(edges: gpd.GeoDataFrame, agg: Callable[[Any], Any]) -> pd.Series:
+    """
+    Clean each edge's observed `maxspeed` into a numeric speed in km per hour.
+
+    Parameters
+    ----------
+    edges
+        Edge GeoDataFrame, possibly containing a `maxspeed` column.
+    agg
+        Aggregation function to use when an edge's maxspeed contains multiple
+        values.
+
+    Returns
+    -------
+    speed_kph
+        Series of observed speeds (km per hour), null where no valid value was
+        present.
+    """
+    if "maxspeed" not in edges.columns:
+        # no edges in graph had a maxspeed attribute
+        return pd.Series(np.nan, index=edges.index, dtype=float)
+
+    # collapse any maxspeed lists (can happen during graph simplification) into
+    # a single value, then clean the string and convert mph to kph if necessary
+    maxspeed = edges["maxspeed"].apply(_collapse_multiple_maxspeed_values, agg=agg)
+    return maxspeed.astype(str).map(_clean_maxspeed).astype(float)
+
+
+def _build_highway_to_group(
+    highways: pd.Series,
+    hwy_groups: dict[str, Iterable[str]] | None,
+) -> dict[str, str]:
+    """
+    Map each highway type in the graph to its predefined road-type group.
+
+    Parameters
+    ----------
+    highways
+        Series of highway types present on the graph's edges.
+    hwy_groups
+        Dict keys are group names and values are iterables of highway types.
+        If None, each highway type is its own group.
+
+    Returns
+    -------
+    highway_to_group
+        Dict keys are highway types and values are their group names.
+    """
+    observed = [str(hwy) for hwy in highways.dropna().unique()]
+
+    if hwy_groups is None:
+        # without explicit groups, every highway type is its own group
+        groups = {hwy: [hwy] for hwy in observed}
+    else:
+        groups = _validate_hwy_groups(hwy_groups)
+        # any highway type the caller did not assign to a group is still
+        # treated as its own group so it can use its own observations
+        assigned = {hwy for hwys in groups.values() for hwy in hwys}
+        for hwy in observed:
+            if hwy not in assigned:
+                groups[hwy] = [hwy]
+
+    return {hwy: group for group, hwys in groups.items() for hwy in hwys}
+
+
+def _aggregate_group_speeds(
+    edges: gpd.GeoDataFrame,
+    min_samples: int,
+    agg: Callable[[Any], Any],
+) -> dict[str, float]:
+    """
+    Aggregate observed speeds within each road-type group.
+
+    Groups with fewer than `min_samples` observations are omitted so their
+    edges fall back to a default value. `agg` is applied to the non-null
+    observed values so the declared strategy (including its handling of
+    extreme values) governs the estimate and custom functions never see nulls.
+
+    Parameters
+    ----------
+    edges
+        Edge GeoDataFrame with `_speed_group` and observed `speed_kph` columns.
+    min_samples
+        Minimum number of observations required to trust a group estimate.
+    agg
+        Aggregation function.
+
+    Returns
+    -------
+    group_estimate
+        Dict keys are group names and values are aggregated speeds (km per
+        hour).
+    """
+    estimates: dict[str, float] = {}
+    grouped = edges.dropna(subset=["_speed_group"]).groupby("_speed_group")
+    for group, grp in grouped:
+        values = grp["speed_kph"].dropna()
+        if len(values) >= min_samples:
+            estimates[group] = float(agg(values))
+    return estimates
+
+
+def _global_default_speed(
+    edges: gpd.GeoDataFrame,
+    declared: pd.Series,
+    fallback: float,
+    agg: Callable[[Any], Any],
+) -> float:
+    """
+    Compute the last-resort default speed for edges with no better evidence.
+
+    The user's `fallback` wins if provided. Otherwise, pool the declared
+    per-type speeds with the observed aggregate of every non-declared highway
+    type and aggregate that pool, preserving the legacy global fallback.
+
+    Parameters
+    ----------
+    edges
+        Edge GeoDataFrame with a `highway` column and observed `speed_kph`.
+    declared
+        Series of declared per-highway-type speeds.
+    fallback
+        User-provided default speed, or null if none was given.
+    agg
+        Aggregation function.
+
+    Returns
+    -------
+    global_default
+        Last-resort default speed (km per hour), or null if none is available.
+    """
+    if not pd.isna(fallback):
+        return float(fallback)
+
+    pool = list(declared.to_numpy(dtype=float))
+    for hwy, grp in edges.groupby("highway"):
+        if hwy not in declared.index:
+            values = grp["speed_kph"].dropna()
+            if len(values) > 0:
+                pool.append(float(agg(values)))
+
+    if len(pool) == 0:
+        return np.nan
+    return float(agg(pd.Series(pool, dtype=float).dropna()))
+
+
+def _select_edge_speeds(
+    observed: pd.Series,
+    group_estimate: pd.Series,
+    declared: pd.Series,
+    global_default: float,
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Select each edge's speed from the available sources and label its source.
+
+    An explicit per-highway-type speed in `hwy_speeds` is a user override for
+    edges missing speed data and therefore outranks imputation, preserving its
+    documented semantics. Otherwise the precedence is the edge's own observed
+    value, then its group estimate, then the global default value.
+
+    Parameters
+    ----------
+    observed
+        Series of each edge's own observed speed (null where missing).
+    group_estimate
+        Series of each edge's group estimate (null where unavailable).
+    declared
+        Series of each edge's declared per-highway-type speed (null if none).
+    global_default
+        Last-resort default speed, or null if none is available.
+
+    Returns
+    -------
+    speed_kph
+        Series of each edge's selected speed.
+    speed_source
+        Series labeling each edge's source as "observed", "group", or
+        "default".
+    """
+    speed_kph = observed.copy()
+    source = pd.Series(_SPEED_SOURCE_OBSERVED, index=observed.index, dtype=object)
+
+    mask = speed_kph.isna() & declared.notna()
+    speed_kph[mask] = declared[mask]
+    source[mask] = _SPEED_SOURCE_DEFAULT
+
+    mask = speed_kph.isna() & group_estimate.notna()
+    speed_kph[mask] = group_estimate[mask]
+    source[mask] = _SPEED_SOURCE_GROUP
+
+    mask = speed_kph.isna()
+    speed_kph[mask] = global_default
+    source[mask] = _SPEED_SOURCE_DEFAULT
+
+    return speed_kph, source
+
+
+def _validate_hwy_groups(hwy_groups: dict[str, Iterable[str]]) -> dict[str, list[str]]:
+    """
+    Validate a road-type grouping and normalize its members to lists.
+
+    Parameters
+    ----------
+    hwy_groups
+        Dict keys are road-type group names and values are iterables of the
+        OSM highway types belonging to that group.
+
+    Returns
+    -------
+    groups
+        Dict keys are group names and values are lists of highway types.
+
+    Raises
+    ------
+    TypeError
+        If `hwy_groups` is not a dict, or a group's members are not an
+        iterable of strings.
+    ValueError
+        If a group is empty, or a highway type belongs to multiple groups.
+    """
+    if not isinstance(hwy_groups, dict):
+        msg = f"`hwy_groups` must be a dict, got {type(hwy_groups).__name__}."
+        raise TypeError(msg)
+
+    groups: dict[str, list[str]] = {}
+    seen: dict[str, str] = {}
+    for name, members in hwy_groups.items():
+        # accept a bare string as a single-member group for convenience
+        if isinstance(members, str):
+            members = [members]
+        try:
+            member_list = list(members)
+        except TypeError as err:
+            msg = f"Members of group {name!r} must be an iterable of strings."
+            raise TypeError(msg) from err
+
+        if len(member_list) == 0:
+            msg = f"Group {name!r} must contain at least one highway type."
+            raise ValueError(msg)
+
+        for hwy in member_list:
+            if not isinstance(hwy, str):
+                msg = f"Highway types in group {name!r} must be strings, got {hwy!r}."
+                raise TypeError(msg)
+            if hwy in seen:
+                msg = (
+                    f"Highway type {hwy!r} appears in multiple groups "
+                    f"({seen[hwy]!r} and {name!r})."
+                )
+                raise ValueError(msg)
+            seen[hwy] = name
+
+        groups[name] = member_list
+
+    return groups
 
 
 def add_edge_travel_times(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
@@ -582,6 +910,11 @@ def add_edge_travel_times(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
     `speed_kph` attribute. All edges must have `length` and `speed_kph`
     attributes and all their values must be non-null.
 
+    If `add_edge_speeds` recorded a `speed_source` attribute on the edges
+    (`"observed"`, `"group"`, or `"default"`), this function copies it to a
+    new `travel_time_source` attribute so the provenance of each edge's travel
+    time remains traceable through the same three tiers.
+
     Parameters
     ----------
     G
@@ -590,7 +923,8 @@ def add_edge_travel_times(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
     Returns
     -------
     G
-        Graph with `travel_time` attributes on all edges.
+        Graph with `travel_time` attributes on all edges, and
+        `travel_time_source` attributes when a `speed_source` attribute exists.
     """
     edges = convert.graph_to_gdfs(G, nodes=False)
 
@@ -610,6 +944,12 @@ def add_edge_travel_times(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
 
     # calculate edge travel time in seconds
     travel_time = distance_km / speed_km_sec
+
+    # carry the speed provenance through to the travel time, if available
+    if "speed_source" in edges.columns:
+        nx.set_edge_attributes(
+            G, values=edges["speed_source"].to_dict(), name="travel_time_source"
+        )
 
     # add travel time attribute to graph edges
     edges["travel_time"] = travel_time.to_numpy()
