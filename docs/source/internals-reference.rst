@@ -35,6 +35,14 @@ osmnx.distance module
     :private-members:
     :noindex:
 
+osmnx.diff module
+-----------------
+
+.. automodule:: osmnx.diff
+    :members:
+    :private-members:
+    :noindex:
+
 osmnx.elevation module
 ----------------------
 

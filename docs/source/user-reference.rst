@@ -29,6 +29,14 @@ osmnx.distance module
 .. automodule:: osmnx.distance
     :members:
 
+.. _osmnx-diff-module:
+
+osmnx.diff module
+-----------------
+
+.. automodule:: osmnx.diff
+    :members:
+
 .. _osmnx-elevation-module:
 
 osmnx.elevation module

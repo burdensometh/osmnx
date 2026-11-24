@@ -18,6 +18,7 @@ from . import _errors as _errors
 from . import bearing as bearing
 from . import convert as convert
 from . import distance as distance
+from . import diff as diff
 from . import elevation as elevation
 from . import features as features
 from . import geocoder as geocoder
