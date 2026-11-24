@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- add routing.shortest_path_with_turns to solve paths over edge identities, honoring manually provided turn restrictions and per-turn, per-edge, and per-node waiting costs, and reporting each path segment's travel time and waiting time
+- allow routing.shortest_path to accept turn restrictions and waiting costs, returning edge-aware routes
+- make routing.route_to_gdf honor a TurnRoute's exact edge identities, including parallel edges, and add its per-edge times and waits
+
 ## 2.2.0 (2026-11-18)
 
 - add Python 3.15 support and drop Python 3.11 support (#1416)

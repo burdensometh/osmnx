@@ -126,6 +126,8 @@ Routing
 
 The ``distance`` module can find the nearest node(s) or edge(s) to coordinates using a fast spatial index. The ``routing`` module can solve shortest paths for network routing, parallelized with multiprocessing, using different weights (e.g., distance, travel time, elevation change, etc). It can also impute missing speeds to the graph edges. This imputation can obviously be imprecise, so the user can override it by passing in arguments that define local speed limits. It can also calculate free-flow travel times for each edge.
 
+For turn-sensitive routing, the ``routing.shortest_path_with_turns`` function solves over edge identities instead of nodes, so it can honor locally provided turn restrictions (such as when maintenance closes one approach to a junction) and attach waiting costs to turns, edges, or nodes. It reports each path segment's travel time and waiting time, and distinguishes parallel edges that share the same endpoints.
+
 Read more about the :ref:`distance <osmnx-distance-module>` and :ref:`routing <osmnx-routing-module>` modules in the User Reference.
 
 Visualization

@@ -43,8 +43,10 @@ from .plot import plot_orientation as plot_orientation
 from .projection import project_graph as project_graph
 from .routing import add_edge_speeds as add_edge_speeds
 from .routing import add_edge_travel_times as add_edge_travel_times
+from .routing import TurnRoute as TurnRoute
 from .routing import k_shortest_paths as k_shortest_paths
 from .routing import shortest_path as shortest_path
+from .routing import shortest_path_with_turns as shortest_path_with_turns
 from .simplification import consolidate_intersections as consolidate_intersections
 from .simplification import simplify_graph as simplify_graph
 from .stats import basic_stats as basic_stats

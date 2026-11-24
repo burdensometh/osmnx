@@ -281,6 +281,124 @@ def test_consolidate_intersections() -> None:
     assert len(Gc.edges) == 1
 
 
+def test_shortest_path_with_turns() -> None:
+    """Test edge-based routing with turn restrictions and waiting costs."""
+    # a walking-style network: 1-2-3 is the direct route, 1-4-5-3 a detour
+    G = nx.MultiDiGraph(crs="epsg:4326")
+    for node, x in ((1, 0), (2, 1), (3, 2), (4, 1), (5, 2)):
+        G.add_node(node, x=float(x), y=0.0, street_count=2)
+    length = 1.0
+    for u, v in ((1, 2), (2, 3), (1, 4), (4, 5), (5, 3)):
+        G.add_edge(u, v, length=length, travel_time=10.0)
+
+    route = ox.routing.shortest_path_with_turns(G, 1, 3, weight="travel_time")
+    assert route is not None
+    assert list(route) == [1, 2, 3]
+    assert route.edges == [(1, 2, 0), (2, 3, 0)]
+    assert route.travel_times == [10.0, 10.0]
+    assert route.wait_times == [0.0, 0.0]
+    assert route.total_time == 20.0
+
+    # forbid the turn from edge 1-2 onto edge 2-3, so the path must detour
+    restricted = ox.routing.shortest_path_with_turns(
+        G,
+        1,
+        3,
+        weight="travel_time",
+        turn_restrictions={(1, 2): (2, 3)},
+    )
+    assert restricted is not None
+    assert list(restricted) == [1, 4, 5, 3]
+
+    # a waiting cost that makes the direct route more expensive than the detour
+    for waiting_costs in ({2: 100.0}, {(2, 3): 100.0}, {((1, 2), (2, 3)): 100.0}):
+        rerouted = ox.routing.shortest_path_with_turns(
+            G,
+            1,
+            3,
+            weight="travel_time",
+            waiting_costs=waiting_costs,
+        )
+        assert rerouted is not None
+        assert list(rerouted) == [1, 4, 5, 3]
+
+    # a small waiting cost is accepted, and is reported per segment
+    waiting = ox.routing.shortest_path_with_turns(
+        G,
+        1,
+        3,
+        weight="travel_time",
+        turn_wait_times={(1, 2): 2.0},
+    )
+    assert waiting is not None
+    assert list(waiting) == [1, 2, 3]
+    assert waiting.wait_times == [0.0, 2.0]
+    assert waiting.total_wait_time == 2.0
+    assert waiting.segments[1]["wait"] == 2.0
+
+    # shortest_path also accepts the turn and waiting arguments
+    assert ox.shortest_path(G, 1, 3, weight="travel_time") == [1, 2, 3]
+    turns = ox.shortest_path(G, 1, 3, weight="travel_time", turn_restrictions={(1, 2): (2, 3)})
+    assert list(turns) == [1, 4, 5, 3]
+    paths = ox.shortest_path(
+        G,
+        [1, 1],
+        [3, 3],
+        weight="travel_time",
+        turn_restrictions={(1, 2): (2, 3)},
+    )
+    assert all(list(path) == [1, 4, 5, 3] for path in paths)
+
+    # parallel edges between the same nodes are handled separately
+    P = nx.MultiDiGraph(crs="epsg:4326")
+    for node in (1, 2):
+        P.add_node(node, x=float(node), y=0.0, street_count=1)
+    P.add_edge(1, 2, key=0, length=10.0, travel_time=5.0)
+    P.add_edge(1, 2, key=1, length=1.0, travel_time=99.0)
+    assert ox.routing.shortest_path_with_turns(P, 1, 2, weight="length").edges == [(1, 2, 1)]
+    assert ox.routing.shortest_path_with_turns(P, 1, 2, weight="travel_time").edges == [(1, 2, 0)]
+    # a waiting cost on only the short edge selects the other parallel edge
+    waited = ox.routing.shortest_path_with_turns(
+        P,
+        1,
+        2,
+        weight="length",
+        edge_wait_times={(1, 2, 1): 200.0},
+    )
+    assert waited is not None
+    assert waited.edges == [(1, 2, 0)]
+
+    # the route's GeoDataFrame keeps its exact edge identities and per-edge
+    # times and waits, and route_to_gdf honors the TurnRoute's own edges
+    gdf = ox.routing.shortest_path_with_turns(P, 1, 2, weight="travel_time").to_gdf(P)
+    assert gdf.index.tolist() == [(1, 2, 0)]
+    assert gdf["travel_time"].tolist() == [5.0]
+    assert gdf["wait_time"].tolist() == [0.0]
+    plain_route = ox.routing.shortest_path_with_turns(P, 1, 2)
+    assert ox.routing.route_to_gdf(P, plain_route).index.tolist() == [(1, 2, 1)]
+
+    # nonexistent edges, invalid waiting costs, and missing paths are handled
+    with pytest.raises(ValueError, match="nonexistent edge"):
+        ox.routing.shortest_path_with_turns(G, 1, 3, turn_restrictions={(9, 9): (1, 2)})
+    with pytest.raises(ValueError, match="nonexistent node"):
+        ox.routing.shortest_path_with_turns(G, 1, 3, node_wait_times={99: 1.0})
+    with pytest.raises(ValueError, match="non-negative"):
+        ox.routing.shortest_path_with_turns(G, 1, 3, edge_wait_times={(1, 2): -1.0})
+    with pytest.raises(nx.NodeNotFound):
+        ox.routing.shortest_path_with_turns(G, 99, 3)
+    no_path = nx.MultiDiGraph(crs="epsg:4326")
+    no_path.add_edge(2, 1, length=1.0)
+    no_path.nodes[1].update(x=0, y=0, street_count=1)
+    no_path.nodes[2].update(x=1, y=0, street_count=1)
+    assert ox.routing.shortest_path_with_turns(no_path, 1, 2) is None
+
+    # an origin equal to the destination yields an empty path
+    same = ox.routing.shortest_path_with_turns(G, 1, 1)
+    assert same is not None
+    assert list(same) == [1]
+    assert same.edges == []
+
+
 def test_simplify_graph() -> None:
     """Test simplifying graphs with missing node and edge attribute values."""
     G = nx.MultiDiGraph(crs="epsg:4326")
@@ -709,6 +827,38 @@ def test_routing() -> None:
     # test k shortest paths
     routes = ox.routing.k_shortest_paths(G, orig_node, dest_node, k=2, weight="travel_time")
     _, _ = ox.plot_graph_routes(G, list(routes))
+
+    # test edge-based routing on a real network: a forbidden turn either yields
+    # a valid detour or no path at all, and the per-segment times and waits are
+    # always consistent
+    path = ox.shortest_path(G, orig_node, dest_node, weight="travel_time")
+    assert path is not None
+    if len(path) >= 3:
+        first, second, third = path[0], path[1], path[2]
+        detour = ox.routing.shortest_path_with_turns(
+            G,
+            orig_node,
+            dest_node,
+            weight="travel_time",
+            turn_restrictions={(first, second): (second, third)},
+        )
+        if detour is not None:
+            assert len(detour.edges) == len(detour.travel_times) == len(detour.wait_times)
+            assert detour.to_gdf(G).index.tolist() == detour.edges
+
+    # a waiting cost keeps the path solvable and is reported per segment
+    waited = ox.routing.shortest_path_with_turns(
+        G,
+        orig_node,
+        dest_node,
+        weight="travel_time",
+        edge_wait_times={(path[0], path[1]): 1.0},
+    )
+    assert waited is not None
+    assert waited.wait_times[0] == pytest.approx(1.0)
+    assert waited.total_time == pytest.approx(
+        waited.total_travel_time + waited.total_wait_time,
+    )
 
     # test great circle and euclidean distance calculators
     assert ox.distance.great_circle(0, 0, 1, 1) == pytest.approx(157249.6034105)
