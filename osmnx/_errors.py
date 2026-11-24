@@ -19,3 +19,21 @@ class InsufficientResponseError(ValueError):
 
 class ResponseStatusCodeError(ValueError):
     """Exception for an unhandled server response status code."""
+
+
+class MissingNodeReferencesError(ValueError):
+    """Exception for way node references that cannot be found in any PBF source."""
+
+    def __init__(self, message: str, report: object | None = None) -> None:
+        """
+        Create the exception, optionally carrying the audit report.
+
+        Parameters
+        ----------
+        message
+            Error description.
+        report
+            The `PBFReadReport` describing the missing references, if available.
+        """
+        super().__init__(message)
+        self.report = report

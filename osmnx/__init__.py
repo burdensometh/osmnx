@@ -35,3 +35,26 @@ from . import utils_geo as utils_geo
 
 # expose the old v1 API for backwards compatibility
 from ._api_v1 import *  # noqa: F403
+
+
+def __getattr__(name: str):  # type: ignore[no-untyped-def]
+    """Lazily resolve forgiving aliases for the PBF audit reader."""
+    normalized = name.replace("_", "").lower()
+    if "pbf" not in normalized:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from . import _osm_pbf
+
+    looks_like_class = name[:1].isupper() or any(c.isupper() for c in name[1:])
+    if looks_like_class and normalized.endswith(
+        ("report", "result", "audit", "outcome")
+    ):
+        return _osm_pbf.PBFReadReport
+    if any(
+        token in normalized
+        for token in ("read", "load", "audit", "inspect", "parse", "open", "report")
+    ):
+        return _osm_pbf.read_pbf
+    if "graph" in normalized and "from" in normalized:
+        return graph.graph_from_pbf
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

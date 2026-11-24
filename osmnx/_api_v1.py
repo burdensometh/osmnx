@@ -7,6 +7,12 @@ ox.function_name() shortcut by exposing these functions directly in the
 package's namespace.
 """
 
+from ._errors import MissingNodeReferencesError as MissingNodeReferencesError
+from ._osm_pbf import AuditReport as AuditReport
+from ._osm_pbf import PBFReadReport as PBFReadReport
+from ._osm_pbf import PBFReadResult as PBFReadResult
+from ._osm_pbf import ReadReport as ReadReport
+from ._osm_pbf import ReadResult as ReadResult
 from .bearing import add_edge_bearings as add_edge_bearings
 from .bearing import orientation_entropy as orientation_entropy
 from .convert import graph_from_gdfs as graph_from_gdfs
@@ -26,10 +32,12 @@ from .geocoder import geocode as geocode
 from .geocoder import geocode_to_gdf as geocode_to_gdf
 from .graph import graph_from_address as graph_from_address
 from .graph import graph_from_bbox as graph_from_bbox
+from .graph import graph_from_pbf as graph_from_pbf
 from .graph import graph_from_place as graph_from_place
 from .graph import graph_from_point as graph_from_point
 from .graph import graph_from_polygon as graph_from_polygon
 from .graph import graph_from_xml as graph_from_xml
+from .graph import read_pbf as read_pbf
 from .io import load_graphml as load_graphml
 from .io import save_graph_geopackage as save_graph_geopackage
 from .io import save_graph_xml as save_graph_xml

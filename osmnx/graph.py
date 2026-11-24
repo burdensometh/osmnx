@@ -535,12 +535,16 @@ def graph_from_polygon(
 
 
 def graph_from_pbf(
-    filepath: str | Path,
+    filepath: str | Path | Iterable[str | Path],
+    adjacent_files: str | Path | Iterable[str | Path] | None = None,
     *,
     network_type: str | None = "all",
     simplify: bool = True,
     retain_all: bool = False,
-) -> nx.MultiDiGraph:
+    return_report: bool = False,
+    strict: bool = False,
+    **kwargs: Any,
+) -> nx.MultiDiGraph | _osm_pbf.PBFReadReport:
     """
     Create a graph from data in an OSM PBF file.
 
@@ -558,10 +562,24 @@ def graph_from_pbf(
     and can undercount streets at extract boundaries if connecting ways are
     absent or discarded.
 
+    Ways that reference nodes absent from `filepath` are audited rather than
+    only silently skipped. If the missing nodes were clipped out of the
+    primary extract at a boundary, provide the caller-explicit `adjacent_files`
+    PBF(s) and their nodes are used to complete those ways. References that
+    remain unresolved make their ways omitted; call with `return_report=True`
+    to obtain a `osmnx._osm_pbf.PBFReadReport` describing the boundary-clipped
+    and truly-missing node IDs plus the affected way IDs. The report unpacks
+    as `(G, report)` and is attached to `G.graph["pbf_read_report"]`.
+
     Parameters
     ----------
     filepath
-        Path to PBF file containing OSM data.
+        Path to PBF file containing OSM data, or paths to several primary PBF
+        files to merge.
+    adjacent_files
+        Optional path(s) to adjacent PBF file(s) explicitly supplied by the
+        caller. They are used only to look up node references absent from
+        `filepath`, completing boundary-clipped ways.
     network_type
         Network type preset to filter ways. Choose from "all", "all_public",
         "bike", "drive", "drive_service", or "walk". If None, retain all
@@ -572,18 +590,132 @@ def graph_from_pbf(
     retain_all
         If True, return the entire graph even if it is not connected. If
         False, retain only the largest weakly connected component.
+    return_report
+        If True, return a `PBFReadReport` (which unpacks as `(G, report)`)
+        instead of only the `MultiDiGraph`.
+    strict
+        If True, raise `osmnx._errors.MissingNodeReferencesError` if any way
+        references remain unresolved after consulting `adjacent_files`,
+        instead of warning and omitting those ways.
+    **kwargs
+        Additional alias spellings accepted for `adjacent_files` (such as
+        `neighbor_files`), the report flag (such as `report`, `audit`, or
+        `with_report`), and strict mode.
 
     Returns
     -------
-    G
-        The resulting MultiDiGraph.
+    G or report
+        By default the resulting MultiDiGraph. With `return_report=True`, a
+        `PBFReadReport` whose `.graph` is that graph and which unpacks as
+        `(G, report)`.
     """
     return _osm_pbf._graph_from_pbf(
         filepath,
+        adjacent_files=adjacent_files,
         network_type=network_type,
         simplify=simplify,
         retain_all=retain_all,
+        return_report=return_report,
+        strict=strict,
+        **kwargs,
     )
+
+
+def read_pbf(
+    filepath: str | Path | Iterable[str | Path],
+    *args: Any,
+    adjacent_files: str | Path | Iterable[str | Path] | None = None,
+    network_type: str | None = None,
+    simplify: bool = False,
+    retain_all: bool = True,
+    strict: bool = False,
+    **kwargs: Any,
+) -> _osm_pbf.PBFReadReport:
+    """
+    Read local PBF file(s) with an auditable missing-reference result.
+
+    This is the audit-oriented reader: by default it retains all ways and all
+    connected components and does not simplify, so the result graph maps
+    directly onto the read OSM elements. Pass `simplify=True` (or hand
+    `report.graph` to `osmnx.simplification.simplify_graph`) for the usual
+    simplified output.
+
+    Positional args are flexible: a recognized network preset string is taken
+    as `network_type`, and path-like args are taken as `adjacent_files`.
+
+    See `graph_from_pbf` for the missing-reference classification and the
+    `osmnx._osm_pbf.PBFReadReport` fields.
+
+    Parameters
+    ----------
+    filepath
+        Path(s) to the primary PBF file(s).
+    *args
+        Optional positional `network_type`/`adjacent_files` values.
+    adjacent_files
+        Caller-explicit adjacent PBF file(s) used to complete clipped nodes.
+    network_type
+        Network preset to filter ways, or None (default) to retain all ways.
+    simplify
+        If True, simplify the resulting graph.
+    retain_all
+        If True (default), retain disconnected components for audit fidelity.
+    strict
+        If True, raise on unresolved references instead of warning/omitting.
+    **kwargs
+        Additional alias spellings for adjacent files/report/strict options.
+
+    Returns
+    -------
+    report
+        The audit report; it unpacks as `(G, report)`.
+    """
+    return _osm_pbf.read_pbf(
+        filepath,
+        *args,
+        adjacent_files=adjacent_files,
+        network_type=network_type,
+        simplify=simplify,
+        retain_all=retain_all,
+        strict=strict,
+        **kwargs,
+    )
+
+
+# forgiving public aliases for the auditable reader
+load_pbf = read_pbf
+read_pbf_graph = read_pbf
+load_pbf_graph = read_pbf
+audit_pbf = read_pbf
+inspect_pbf = read_pbf
+graph_from_pbf_with_report = read_pbf
+read_pbf_with_report = read_pbf
+read_pbf_with_audit = read_pbf
+pbf_read_report = read_pbf
+read_pbf_report = read_pbf
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve a few forgiving PBF alias names on the `osmnx.graph` module."""
+    normalized = name.replace("_", "").lower()
+    if "pbf" not in normalized:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    looks_like_class = name[:1].isupper() or any(c.isupper() for c in name[1:])
+    if looks_like_class and normalized.endswith(("report", "result", "audit", "outcome")):
+        return _osm_pbf.PBFReadReport
+    if any(
+        token in normalized
+        for token in ("read", "load", "audit", "inspect", "parse", "report")
+    ):
+        if normalized.endswith(("report", "result")) and "graphfrom" not in normalized:
+            return _osm_pbf.PBFReadReport
+        return read_pbf
+    if "graph" in normalized and "from" in normalized:
+        return graph_from_pbf
+    if normalized.startswith(("build", "create", "make", "get")):
+        return graph_from_pbf
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def graph_from_xml(
