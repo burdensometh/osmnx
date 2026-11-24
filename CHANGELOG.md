@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- add `routing.nearest_source` function to solve the nearest of multiple source nodes to each target node, with deterministic tie-breaking
+
 ## 2.2.0 (2026-11-18)
 
 - add Python 3.15 support and drop Python 3.11 support (#1416)

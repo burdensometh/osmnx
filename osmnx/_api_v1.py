@@ -44,6 +44,7 @@ from .projection import project_graph as project_graph
 from .routing import add_edge_speeds as add_edge_speeds
 from .routing import add_edge_travel_times as add_edge_travel_times
 from .routing import k_shortest_paths as k_shortest_paths
+from .routing import nearest_source as nearest_source
 from .routing import shortest_path as shortest_path
 from .simplification import consolidate_intersections as consolidate_intersections
 from .simplification import simplify_graph as simplify_graph

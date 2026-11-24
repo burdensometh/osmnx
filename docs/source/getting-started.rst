@@ -124,7 +124,7 @@ Read more about the :ref:`elevation <osmnx-elevation-module>` module in the User
 Routing
 ^^^^^^^
 
-The ``distance`` module can find the nearest node(s) or edge(s) to coordinates using a fast spatial index. The ``routing`` module can solve shortest paths for network routing, parallelized with multiprocessing, using different weights (e.g., distance, travel time, elevation change, etc). It can also impute missing speeds to the graph edges. This imputation can obviously be imprecise, so the user can override it by passing in arguments that define local speed limits. It can also calculate free-flow travel times for each edge.
+The ``distance`` module can find the nearest node(s) or edge(s) to coordinates using a fast spatial index. The ``routing`` module can solve shortest paths for network routing, parallelized with multiprocessing, using different weights (e.g., distance, travel time, elevation change, etc). It can also impute missing speeds to the graph edges. This imputation can obviously be imprecise, so the user can override it by passing in arguments that define local speed limits. It can also calculate free-flow travel times for each edge. The ``routing.nearest_source`` function solves the shortest path from the nearest of several source nodes to each target node, assigning every target to one source (for example, mapping each neighborhood to its nearest service point by network distance) and returning the result as a table.
 
 Read more about the :ref:`distance <osmnx-distance-module>` and :ref:`routing <osmnx-routing-module>` modules in the User Reference.
 

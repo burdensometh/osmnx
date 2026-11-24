@@ -636,7 +636,7 @@ def test_elevation() -> None:
 
 
 @pytest.mark.xdist_group(name="group0")
-def test_routing() -> None:
+def test_routing() -> None:  # noqa: PLR0915
     """Test working with speed, travel time, and routing."""
     G = ox.graph_from_address(address=address, dist=500, dist_type="bbox", network_type="bike")
 
@@ -710,9 +710,107 @@ def test_routing() -> None:
     routes = ox.routing.k_shortest_paths(G, orig_node, dest_node, k=2, weight="travel_time")
     _, _ = ox.plot_graph_routes(G, list(routes))
 
+    # test nearest source assignment on the real network
+    targets = [int(x) for x in np.random.default_rng(seed=0).choice(np.array(G.nodes), size=20)]
+    result = ox.nearest_source(G, [orig_node, dest_node], targets, weight="length")
+    assert list(result.index) == targets
+    assert result.index.name == "node"
+    assert set(result.columns) == {"source", "cost"}
+    assert (result["cost"].dropna() >= 0).all()
+    # each target's assigned source must be one of the sources
+    assert result["source"].dropna().isin({orig_node, dest_node}).all()
+
+    # costs must match individual shortest path lengths from the assigned source
+    for target, (source, cost) in result.iterrows():
+        if pd.notna(source):
+            expected = nx.shortest_path_length(G, int(source), int(target), weight="length")
+            assert cost == pytest.approx(expected)
+
     # test great circle and euclidean distance calculators
     assert ox.distance.great_circle(0, 0, 1, 1) == pytest.approx(157249.6034105)
     assert ox.distance.euclidean(0, 0, 1, 1) == pytest.approx(1.4142135)
+
+
+@pytest.mark.xdist_group(name="group0")
+def test_nearest_source() -> None:
+    """Test multi-source nearest source assignment with deterministic ties."""
+    G = nx.MultiDiGraph()
+    for node, (x, y) in {
+        1: (0, 0),
+        2: (1, 0),
+        3: (2, 0),
+        4: (3, 0),
+        5: (1, 1),
+        6: (2, 1),
+        7: (9, 9),
+    }.items():
+        G.add_node(node, x=float(x), y=float(y), street_count=1)
+
+    def add_edge(u: int, v: int, length: float) -> None:
+        G.add_edge(u, v, length=length, osmid=len(G.edges))
+
+    add_edge(1, 2, 2)
+    add_edge(2, 3, 2)
+    add_edge(3, 4, 2)
+    add_edge(5, 2, 1)
+    add_edge(5, 6, 1)
+    add_edge(6, 3, 1)
+
+    # basic assignment: node 1 is nearest to source 1, all others to source 5
+    df = ox.routing.nearest_source(G, sources=[5, 1], targets=[1, 2, 3, 4, 5, 6])
+    assert list(df.index) == [1, 2, 3, 4, 5, 6]
+    assert df.index.name == "node"
+    assert df.loc[1, "source"] == 1
+    assert df.loc[2, "source"] == 5
+    assert df.loc[4, "source"] == 5
+    assert df.loc[4, "cost"] == 4
+    assert df.loc[5, "cost"] == 0
+
+    # unreachable target is retained with null source and cost
+    df = ox.routing.nearest_source(G, sources=[1], targets=[3, 7])
+    assert 7 in df.index
+    assert pd.isna(df.loc[7, "source"])
+    assert pd.isna(df.loc[7, "cost"])
+    # nullable integer dtype keeps unreachable source null rather than float
+    assert str(df["source"].dtype) == "Int64"
+
+    # tie-breaking is deterministic and independent of source ordering
+    T = nx.MultiDiGraph()
+    for node in (1, 2, 10):
+        T.add_node(node, x=0.0, y=0.0, street_count=1)
+    T.add_edge(1, 10, length=5.0, osmid=0)
+    T.add_edge(2, 10, length=5.0, osmid=1)
+    assert ox.routing.nearest_source(T, [1, 2], 10).loc[10, "source"] == 1
+    assert ox.routing.nearest_source(T, [2, 1], 10).loc[10, "source"] == 1
+
+    # scalar source/target arguments are accepted
+    assert ox.routing.nearest_source(T, 2, 10).loc[10, "source"] == 2
+
+    # parallel edges: the minimum weight parallel edge is used
+    P = nx.MultiDiGraph()
+    for node in (1, 2):
+        P.add_node(node, x=0.0, y=0.0, street_count=1)
+    P.add_edge(1, 2, length=9.0, osmid=0)
+    P.add_edge(1, 2, length=4.0, osmid=1)
+    assert ox.routing.nearest_source(P, 1, 2).loc[2, "cost"] == 4
+
+    # directed costs: travel follows edge direction, so reversing the graph
+    # changes which nodes are reachable
+    D = nx.MultiDiGraph()
+    for node in (1, 2):
+        D.add_node(node, x=0.0, y=0.0, street_count=1)
+    D.add_edge(1, 2, length=3.0, osmid=0)
+    assert ox.routing.nearest_source(D, 1, [1, 2]).loc[2, "source"] == 1
+    rev = ox.routing.nearest_source(D.reverse(copy=False), 1, [1, 2])
+    assert pd.isna(rev.loc[2, "source"])
+
+    # targets default to every node in the graph
+    assert set(ox.routing.nearest_source(G, sources=[1]).index) == set(G.nodes)
+
+    # missing nodes raise an error
+    msg = "does not contain node"
+    with pytest.raises(nx.exception.NodeNotFound, match=msg):
+        ox.routing.nearest_source(G, sources=[1], targets=[99])
 
 
 @pytest.mark.xdist_group(name="group1")

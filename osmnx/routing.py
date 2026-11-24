@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import itertools
 import logging as lg
 import multiprocessing as mp
@@ -452,6 +453,121 @@ def _single_shortest_path(
         msg = f"Cannot solve path from {orig} to {dest}"
         utils.log(msg, level=lg.WARNING)
         return None
+
+
+def nearest_source(
+    G: nx.MultiDiGraph,
+    sources: int | Iterable[int],
+    targets: int | Iterable[int] | None = None,
+    *,
+    weight: str = "length",
+) -> pd.DataFrame:
+    """
+    Solve the shortest path from the nearest of several sources to each target.
+
+    This function solves a single multi-source Dijkstra search, simultaneously
+    finding, for every target node, the minimum total `weight` along a path
+    from any of the `sources` and the source node that achieves it. For
+    example, given the locations of several service points in a directed
+    street network, it assigns every other node to its nearest service point
+    by network distance (a network Voronoi partition).
+
+    Paths follow edge direction, so costs are measured traveling from a source
+    to a target. To measure costs traveling from each target to the nearest
+    source instead, pass in the reversed graph (`G.reverse(copy=False)`).
+
+    Ties in total cost are broken deterministically: among all sources that
+    achieve the minimum cost to a target, the source with the smallest node ID
+    (in ascending sort order) is assigned. The result is therefore stable and
+    independent of the order in which `sources` and `targets` are provided.
+
+    Targets that no source can reach are retained in the result with a missing
+    (null) assigned source and a null cost, rather than being omitted.
+
+    Parameters
+    ----------
+    G
+        Input graph.
+    sources
+        Source node ID(s) to solve from, such as service point locations.
+    targets
+        Target node ID(s) to solve to. If None, use every node in the graph.
+    weight
+        Edge attribute to minimize when solving shortest paths. Must be
+        numeric and present on the graph's edges.
+
+    Returns
+    -------
+    df
+        DataFrame indexed by target node ID (index name "node"), with one row
+        per target in the order given. Its "source" column holds the node ID
+        of the nearest source (a nullable integer, null if unreachable) and
+        its "cost" column holds the total `weight` along the shortest path
+        from that source (null if unreachable). Convert to other tabular
+        formats with, for example, `df.to_dict()`, `df.to_csv()`, or
+        `df.reset_index()`.
+    """
+    _validate._verify_numeric_edge_attribute(G, weight, strict=False)
+
+    # normalize single node IDs to one-element lists
+    source_ids = list(sources) if isinstance(sources, Iterable) else [sources]
+    if len(source_ids) == 0:  # pragma: no cover
+        msg = "`sources` must contain at least one node ID."
+        raise ValueError(msg)
+    if targets is None:
+        target_ids = list(G.nodes)
+    elif isinstance(targets, Iterable):
+        target_ids = list(targets)
+    else:
+        target_ids = [targets]
+
+    # validate that every source and target node exists in the graph
+    missing = sorted({n for n in source_ids if n not in G} | {n for n in target_ids if n not in G})
+    if len(missing) > 0:
+        msg = f"The graph does not contain node(s) {missing}."
+        raise nx.exception.NodeNotFound(msg)
+
+    # sort and de-duplicate sources so that the deterministic tie-breaking rule
+    # (smallest source node ID wins) does not depend on the caller's ordering
+    sources_sorted = sorted(set(source_ids))
+    rank: dict[int, int] = {s: i for i, s in enumerate(sources_sorted)}
+
+    # run one multi-source Dijkstra search. Heap entries are tuples of
+    # (cost, source rank, node) so that, at equal cost, the smaller source
+    # rank is always finalized first and thus wins the tie.
+    dist: dict[int, float] = {}
+    source_of: dict[int, int] = {}
+    heap: list[tuple[float, int, int]] = [(0.0, rank[s], s) for s in sources_sorted]
+    heapq.heapify(heap)
+
+    while heap:
+        cost, source_rank, node = heapq.heappop(heap)
+        if node in dist:
+            # node already finalized at an equal or lower cost
+            continue
+        dist[node] = cost
+        source_of[node] = sources_sorted[source_rank]
+        for neighbor, edge_data in G.adj[node].items():
+            # among parallel edges, minimize the weight like NetworkX does
+            if G.is_multigraph():
+                edge_weight = min(d.get(weight, 1) for d in edge_data.values())
+            else:  # pragma: no cover
+                edge_weight = edge_data.get(weight, 1)
+            if edge_weight < 0:  # pragma: no cover
+                msg = (
+                    f"The edge attribute {weight!r} contains a negative value, "
+                    "which Dijkstra's algorithm does not support."
+                )
+                raise ValueError(msg)
+            if neighbor not in dist:
+                heapq.heappush(heap, (cost + edge_weight, source_rank, neighbor))
+
+    # assemble the result in the caller's target order, keeping unreachable
+    # targets as rows with null source and cost
+    index = pd.Index(target_ids, name="node")
+    source_col = pd.array([source_of.get(t) for t in target_ids], dtype="Int64")
+    cost_col = np.array([dist.get(t, np.nan) for t in target_ids], dtype=float)
+    return pd.DataFrame({"source": source_col, "cost": cost_col}, index=index)
 
 
 def add_edge_speeds(
