@@ -317,7 +317,7 @@ def graph_from_place(
     simplify: bool = True,
     retain_all: bool = False,
     truncate_by_edge: bool = False,
-    which_result: int | list[int | None] | None = None,
+    which_result: int | str | dict[str, Any] | list[Any] | None = None,
     custom_filter: str | list[str] | None = None,
 ) -> nx.MultiDiGraph:
     """
@@ -331,10 +331,16 @@ def graph_from_place(
 
     If OSM does have polygon boundaries for this place but you're not finding
     it, try to vary the query string, pass in a structured query dict, or vary
-    the `which_result` argument to use a different geocode result. If you know
-    the OSM ID of the place, you can retrieve its boundary polygon using the
-    `geocode_to_gdf` function, then pass it to the `features_from_polygon`
-    function.
+    the `which_result` argument to use a different geocode result.
+
+    A place name can match several OSM elements, such as several same-named
+    districts, and the resulting scope may legitimately consist of several
+    valid sub-areas. Use `which_result` to pick a specific result by position
+    or by region identifier (an OSM ID string like `"R1234"`), or pass a list
+    to combine several results into one query area. The names and source
+    identities of the combined places are retained in the returned graph's
+    `place` metadata attribute. If a place resolves only to an approximate
+    point, a warning names the place lacking a boundary polygon.
 
     This function uses filters to query the Overpass API: you can either
     specify a pre-defined `network_type` or provide your own `custom_filter`
@@ -364,8 +370,12 @@ def graph_from_place(
         If True, retain nodes outside the place boundary polygon(s) if at
         least one of the node's neighbors lies within the polygon(s).
     which_result
-        Which geocoding result to use. if None, auto-select the first
-        (Multi)Polygon or raise an error if OSM doesn't return one.
+        Which geocoding result(s) to use. If None, auto-select the first
+        (Multi)Polygon or raise an error if OSM doesn't return one. Pass a
+        region identifier (`"R1234"`, `"relation/1234"`, or a dict with
+        `osm_type`/`osm_id` or `place_id` keys) to select a specific element,
+        or a list of positions and/or identifiers to combine several results
+        into one query area.
     custom_filter
         A custom ways filter to be used instead of the `network_type` presets,
         e.g. `'["power"~"line"]' or '["highway"~"motorway|trunk"]'`. If `str`,
@@ -388,8 +398,9 @@ def graph_from_place(
     function to automatically make multiple requests: see that function's
     documentation for caveats.
     """
-    # extract the geometry from the GeoDataFrame to use in query
-    polygon = geocoder.geocode_to_gdf(query, which_result=which_result).union_all()
+    # extract the boundary geometry and per-place provenance from the results
+    gdf = geocoder.geocode_to_gdf(query, which_result=which_result)
+    polygon, places = geocoder._boundary_polygon_and_places(gdf)
     msg = "Constructed place geometry polygon(s) to query Overpass"
     utils.log(msg, level=lg.INFO)
 
@@ -402,6 +413,9 @@ def graph_from_place(
         truncate_by_edge=truncate_by_edge,
         custom_filter=custom_filter,
     )
+
+    # retain each combined place's name and source identity as metadata
+    G.graph["place"] = places
 
     msg = f"graph_from_place returned graph with {len(G):,} nodes and {len(G.edges):,} edges"
     utils.log(msg, level=lg.INFO)

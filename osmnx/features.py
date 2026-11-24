@@ -222,7 +222,7 @@ def features_from_place(
     query: str | dict[str, str] | list[str | dict[str, str]],
     tags: dict[str, bool | str | list[str]],
     *,
-    which_result: int | list[int | None] | None = None,
+    which_result: int | str | dict[str, Any] | list[Any] | None = None,
 ) -> gpd.GeoDataFrame:
     """
     Download OSM features within the boundaries of some place(s).
@@ -235,10 +235,16 @@ def features_from_place(
 
     If OSM does have polygon boundaries for this place but you're not finding
     it, try to vary the query string, pass in a structured query dict, or vary
-    the `which_result` argument to use a different geocode result. If you know
-    the OSM ID of the place, you can retrieve its boundary polygon using the
-    `geocode_to_gdf` function, then pass it to the `features_from_polygon`
-    function.
+    the `which_result` argument to use a different geocode result.
+
+    A place name can match several OSM elements, such as several same-named
+    districts, and the resulting scope may legitimately consist of several
+    valid sub-areas. Use `which_result` to pick a specific result by position
+    or by region identifier (an OSM ID string like `"R1234"`), or pass a list
+    to combine several results into one query area. The names and source
+    identities of the combined places are retained in the returned
+    GeoDataFrame's `attrs["place"]` metadata. If a place resolves only to an
+    approximate point, a warning names the place lacking a boundary polygon.
 
     You can use the `settings` module to retrieve a snapshot of historical OSM
     data as of a certain date, or to configure the Overpass server timeout,
@@ -262,21 +268,30 @@ def features_from_place(
         'highway':'bus_stop'}` would return all amenities, any landuse=retail,
         any landuse=commercial, and any highway=bus_stop.
     which_result
-        Which search result to return. If None, auto-select the first
-        (Multi)Polygon or raise an error if OSM doesn't return one.
+        Which search result(s) to return. If None, auto-select the first
+        (Multi)Polygon or raise an error if OSM doesn't return one. Pass a
+        region identifier (`"R1234"`, `"relation/1234"`, or a dict with
+        `osm_type`/`osm_id` or `place_id` keys) to select a specific element,
+        or a list of positions and/or identifiers to combine several results
+        into one query area.
 
     Returns
     -------
     gdf
         The features, multi-indexed by element type and OSM ID.
     """
-    # extract the geometry from the GeoDataFrame to use in query
-    polygon = geocoder.geocode_to_gdf(query, which_result=which_result).union_all()
+    # extract the boundary geometry and per-place provenance from the results
+    gdf = geocoder.geocode_to_gdf(query, which_result=which_result)
+    polygon, places = geocoder._boundary_polygon_and_places(gdf)
     msg = "Constructed place geometry polygon(s) to query Overpass"
     utils.log(msg, level=lg.INFO)
 
     # create GeoDataFrame using this polygon(s) geometry
-    return features_from_polygon(polygon, tags)
+    features_gdf = features_from_polygon(polygon, tags)
+
+    # attach the place provenance as a GeoDataFrame-level attribute
+    features_gdf.attrs["place"] = places
+    return features_gdf
 
 
 def features_from_polygon(

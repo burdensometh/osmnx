@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- let `geocode_to_gdf` (and the place entry points `graph_from_place` and `features_from_place`) select place boundary results by caller-provided region identifier, or combine several valid sub-areas, while retaining each place's name and source identity
+- report the specific place names lacking a boundary when a query resolves only to an approximate point
+
 ## 2.2.0 (2026-11-18)
 
 - add Python 3.15 support and drop Python 3.11 support (#1416)

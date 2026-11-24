@@ -17,6 +17,7 @@ import os
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
+from unittest import mock
 
 import geopandas as gpd
 import networkx as nx
@@ -189,6 +190,9 @@ def test_geocoder() -> None:
     city = ox.geocode_to_gdf(place1, which_result=1)
     city_projected = ox.projection.project_gdf(city, to_crs="epsg:3395")
 
+    # provenance columns are retained for each geocoded place
+    assert {"name", "osm_type", "osm_id", "place_id", "query", "which_result"} <= set(city.columns)
+
     # test geocoding a bad query: should raise exception
     with pytest.raises(ox._errors.InsufficientResponseError):
         _ = ox.geocode("!@#$%^&*")
@@ -197,8 +201,106 @@ def test_geocoder() -> None:
         _ = ox.geocode_to_gdf(query="AAAZZZ")
 
     # fails to geocode to a (Multi)Polygon
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="did not return a boundary polygon"):
         _ = ox.geocode_to_gdf("Bunker Hill, Los Angeles, California, USA")
+
+
+@mock.patch("osmnx._nominatim._download_nominatim_element")
+def test_geocoder_multiple_results(mock_download: mock.Mock) -> None:
+    """Test selecting and combining several same-name place boundaries."""
+    poly_a = {
+        "type": "Polygon",
+        "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+    }
+    poly_b = {
+        "type": "Polygon",
+        "coordinates": [[[2, 0], [3, 0], [3, 1], [2, 1], [2, 0]]],
+    }
+    mock_download.return_value = [
+        {
+            "place_id": 3,
+            "osm_type": "relation",
+            "osm_id": 200,
+            "lat": "0.5",
+            "lon": "2.5",
+            "display_name": "Springfield B",
+            "name": "Springfield",
+            "importance": 0.7,
+            "boundingbox": ["0", "1", "2", "3"],
+            "geojson": poly_b,
+        },
+        {
+            "place_id": 2,
+            "osm_type": "relation",
+            "osm_id": 100,
+            "lat": "0.5",
+            "lon": "0.5",
+            "display_name": "Springfield A",
+            "name": "Springfield",
+            "importance": 0.8,
+            "boundingbox": ["0", "1", "0", "1"],
+            "geojson": poly_a,
+        },
+    ]
+
+    # select several results by position: one row per sub-area
+    gdf = ox.geocode_to_gdf("Springfield", which_result=[1, 2])
+    assert len(gdf) == 2
+    assert gdf["osm_id"].tolist() == [100, 200]
+    assert gdf["which_result"].tolist() == [1, 2]
+    assert gdf["query"].eq("Springfield").all()
+
+    # select one result by caller-provided region identifier
+    gdf = ox.geocode_to_gdf("Springfield", which_result="R200")
+    assert gdf["osm_id"].tolist() == [200]
+
+    # select by identifier dict
+    gdf = ox.geocode_to_gdf("Springfield", which_result={"osm_type": "relation", "osm_id": 100})
+    assert gdf["osm_id"].tolist() == [100]
+
+    # combine several sub-areas while retaining each place's name and identity
+    gdf = ox.geocode_to_gdf("Springfield", which_result=[1, "R200"])
+    polygon, places = ox.geocoder._boundary_polygon_and_places(gdf)
+    assert polygon.geom_type == "MultiPolygon"
+    assert [p["name"] for p in places] == ["Springfield", "Springfield"]
+    assert [p["osm_id"] for p in places] == [100, 200]
+    assert [p["display_name"] for p in places] == ["Springfield A", "Springfield B"]
+
+    # an unknown region identifier raises an error
+    with pytest.raises(ox._errors.InsufficientResponseError, match="no result matching"):
+        _ = ox.geocode_to_gdf("Springfield", which_result="R999")
+
+    # a malformed region identifier raises an error
+    with pytest.raises(ValueError, match="is not an OSM ID"):
+        _ = ox.geocode_to_gdf("Springfield", which_result="not-an-id")
+
+
+@mock.patch("osmnx._nominatim._download_nominatim_element")
+def test_geocoder_missing_boundaries(mock_download: mock.Mock) -> None:
+    """Test that queries lacking a boundary polygon are named in the error."""
+    point = {"type": "Point", "coordinates": [5, 5]}
+    mock_download.return_value = [
+        {
+            "place_id": 4,
+            "osm_type": "node",
+            "osm_id": 10,
+            "lat": "5",
+            "lon": "5",
+            "display_name": "Somewhere",
+            "name": "Somewhere",
+            "importance": 0.5,
+            "boundingbox": ["4", "6", "4", "6"],
+            "geojson": point,
+        },
+    ]
+
+    # a query resolving only to an approximate point names that place
+    with pytest.raises(TypeError, match="Somewhere"):
+        _ = ox.geocode_to_gdf("Somewhere")
+
+    # when one of several queries lacks a boundary, only its name is reported
+    with pytest.raises(TypeError, match="Somewhere"):
+        _ = ox.geocode_to_gdf(["Somewhere", "Elsewhere"])
 
 
 @pytest.mark.xdist_group(name="group1")
