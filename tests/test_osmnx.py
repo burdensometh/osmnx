@@ -17,6 +17,7 @@ import os
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
+from typing import Any
 
 import geopandas as gpd
 import networkx as nx
@@ -95,6 +96,106 @@ def test_exceptions() -> None:
 
     with pytest.raises(ox._errors.ResponseStatusCodeError):
         raise ox._errors.ResponseStatusCodeError(message)
+
+    with pytest.raises(ox._errors.SourceConflictError):
+        raise ox._errors.SourceConflictError(message)
+
+
+@pytest.mark.xdist_group(name="group0")
+def test_merge_sources() -> None:
+    """Test merging duplicate elements from multiple source parcels."""
+    merge = ox._merge
+
+    def node(osmid: int, version: int, lat: float, lon: float, **tags: str) -> dict[str, Any]:
+        element: dict[str, Any] = {
+            "type": "node",
+            "id": osmid,
+            "version": version,
+            "timestamp": f"2020-01-0{version}T00:00:00Z",
+            "lat": lat,
+            "lon": lon,
+        }
+        if tags:
+            element["tags"] = tags
+        return element
+
+    def way(osmid: int, version: int, nodes: list[int], **tags: str) -> dict[str, Any]:
+        element: dict[str, Any] = {
+            "type": "way",
+            "id": osmid,
+            "version": version,
+            "timestamp": f"2020-01-0{version}T00:00:00Z",
+            "nodes": nodes,
+        }
+        if tags:
+            element["tags"] = tags
+        return element
+
+    # two parcels observe an overlapping boundary element: they must merge
+    parcel0 = {
+        "elements": [node(1, 1, 0.0, 0.0), node(2, 1, 0.0, 0.001)],
+        "_source": "parcel-0",
+    }
+    parcel1 = {
+        "elements": [node(2, 2, 0.0, 0.001), node(3, 1, 0.0, 0.002)],
+        "_source": "parcel-1",
+    }
+    elements, provenance, count = merge.merge_osm_elements([parcel0, parcel1])
+    assert count == 2
+    assert [element["id"] for element in elements] == [1, 2, 3]
+    # the newer version wins and is recorded as coming from both parcels
+    assert provenance[("node", 2)] == ["parcel-0", "parcel-1"]
+    assert elements[1]["version"] == 2
+
+    # a node and a way sharing an ID are distinct elements, not duplicates
+    shared = [
+        {"elements": [node(7, 1, 0.0, 0.0)], "_source": "parcel-0"},
+        {"elements": [way(7, 1, [1, 2])], "_source": "parcel-1"},
+    ]
+    elements, _, _ = merge.merge_osm_elements(shared)
+    assert [element["type"] for element in elements] == ["node", "way"]
+
+    # response order must not change the merged elements or their provenance
+    forward = merge.merge_osm_elements([parcel0, parcel1])
+    reverse = merge.merge_osm_elements([parcel1, parcel0])
+    assert forward[0] == reverse[0]
+    assert forward[1] == reverse[1]
+
+    # response order must not change the built graph either
+    def build(responses: list[dict[str, Any]]) -> nx.MultiDiGraph:
+        return ox.graph._create_graph(responses, bidirectional=False)
+
+    graph_forward = build([parcel0, parcel1])
+    graph_reverse = build([parcel1, parcel0])
+    assert nx.utils.graphs_equal(graph_forward, graph_reverse)
+    assert graph_forward.nodes[2]["source_parcels"] == "parcel-0,parcel-1"
+
+    # tied version facts with differing non-geometry tags resolve canonically
+    tagged0 = {"elements": [node(9, 3, 0.0, 0.0, name="B")], "_source": "parcel-A"}
+    tagged1 = {"elements": [node(9, 3, 0.0, 0.0, name="A")], "_source": "parcel-B"}
+    a = merge.merge_osm_elements([tagged0, tagged1])
+    b = merge.merge_osm_elements([tagged1, tagged0])
+    assert a[0] == b[0]
+    assert a[0][0]["tags"] == {"name": "A"}
+
+    # tied version facts with differing coordinates are an unresolvable error
+    conflict0 = {"elements": [node(9, 3, 0.0, 0.0)], "_source": "parcel-A"}
+    conflict1 = {"elements": [node(9, 3, 0.5, 0.5)], "_source": "parcel-B"}
+    with pytest.raises(ox._errors.SourceConflictError, match="node 9") as excinfo:
+        merge.merge_osm_elements([conflict0, conflict1])
+    # the message locates the element and both conflicting source parcels
+    message = str(excinfo.value)
+    assert "parcel-A" in message
+    assert "parcel-B" in message
+    assert "0.5" in message
+
+    # unlabeled responses fall back to a content-derived signature
+    unlabeled0 = {"elements": [node(1, 1, 0.0, 0.0), node(2, 1, 0.0, 0.001)]}
+    unlabeled1 = {"elements": [node(1, 1, 0.0, 0.0), node(3, 1, 0.0, 0.002)]}
+    elements, provenance, _ = merge.merge_osm_elements([unlabeled0, unlabeled1])
+    assert [element["id"] for element in elements] == [1, 2, 3]
+    # the shared element is attributed to both distinct content signatures
+    assert len(provenance[("node", 1)]) == 2
 
 
 @pytest.mark.xdist_group(name="group1")
@@ -1041,6 +1142,30 @@ def test_features() -> None:
     response_jsons = ({"elements": [element]}, {"elements": [element.copy()]})
     gdf = ox.features._create_gdf(response_jsons, Polygon(), {})
     assert gdf.index.is_unique
+
+    # boundary elements returned by multiple parcels merge, not duplicate
+    element_old = {
+        "type": "node",
+        "id": 1,
+        "version": 1,
+        "timestamp": "2020-01-01T00:00:00Z",
+        "lat": 0.0,
+        "lon": 0.0,
+        "tags": {"amenity": "bench"},
+    }
+    element_new = {**element_old, "version": 2, "timestamp": "2020-01-02T00:00:00Z"}
+    labeled = [
+        {"elements": [element_old], "_source": "parcel-0"},
+        {"elements": [element_new], "_source": "parcel-1"},
+    ]
+    gdf1 = ox.features._create_gdf(labeled, Polygon(), {})
+    gdf2 = ox.features._create_gdf(labeled[::-1], Polygon(), {})
+    assert gdf1.index.is_unique
+    # record provenance from both parcels, independent of response order
+    assert gdf1["source_parcels"].tolist() == ["parcel-0,parcel-1"]
+    assert gdf2["source_parcels"].tolist() == ["parcel-0,parcel-1"]
+    # drop element metadata gathered only for conflict resolution
+    assert not ({"version", "timestamp", "uid", "user", "changeset"} & set(gdf1.columns))
 
     # test cache_only_mode
     ox.settings.cache_only_mode = True

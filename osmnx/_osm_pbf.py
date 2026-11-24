@@ -66,6 +66,44 @@ def _remove_incomplete_ways(
     return complete_ways
 
 
+def _element_metadata(element: Any) -> dict[str, Any]:  # noqa: ANN401
+    """
+    Extract an element's version metadata for conflict resolution.
+
+    The PBF reader exposes the same version facts as the Overpass API, so
+    collecting them here lets multi-file PBF merges resolve conflicts the same
+    way API responses do.
+
+    Parameters
+    ----------
+    element
+        An osmium node or way object.
+
+    Returns
+    -------
+    metadata
+        The available `version`, `timestamp`, `changeset`, `uid`, and `user`
+        attributes, keyed by name. Missing values are omitted.
+    """
+    metadata: dict[str, Any] = {}
+    version = getattr(element, "version", None)
+    if version is not None:
+        metadata["version"] = version
+    timestamp = getattr(element, "timestamp", None)
+    if timestamp is not None:
+        metadata["timestamp"] = timestamp.isoformat()
+    changeset = getattr(element, "changeset", None)
+    if changeset:
+        metadata["changeset"] = changeset
+    uid = getattr(element, "uid", None)
+    if uid:
+        metadata["uid"] = uid
+    user = getattr(element, "user", None)
+    if user:
+        metadata["user"] = user
+    return metadata
+
+
 def _overpass_json_from_pbf(
     filepath: str | Path,
     network_type: str | None,
@@ -113,6 +151,7 @@ def _overpass_json_from_pbf(
                 "id": way.id,
                 "nodes": node_ids,
                 "tags": tags,
+                **_element_metadata(way),
             },
         )
         way_node_ids.update(node_ids)
@@ -131,6 +170,7 @@ def _overpass_json_from_pbf(
                 "lon": node.location.lon,
                 "lat": node.location.lat,
                 "tags": dict(node.tags),
+                **_element_metadata(node),
             },
         )
         found_node_ids.add(node.id)

@@ -14,6 +14,7 @@ import pandas as pd
 from shapely import LineString
 from shapely import Point
 
+from . import _merge
 from . import convert
 from . import stats
 from . import utils
@@ -438,6 +439,10 @@ def simplify_graph(  # noqa: C901, PLR0912
                 # if this attribute's values must be aggregated, do so now
                 agg_func = edge_attr_aggs[attr_name]
                 path_attributes[attr_name] = agg_func(attr_values)
+            elif attr_name == _merge.PROVENANCE_ATTR:
+                # source parcels are a union across merged segments, never a
+                # list of per-segment strings
+                path_attributes[attr_name] = _merge.merge_provenance(attr_values)
             elif len(set(attr_values)) == 1:
                 # if there's only 1 unique value, keep that single value
                 path_attributes[attr_name] = attr_values[0]
@@ -786,6 +791,10 @@ def _consolidate_intersections_rebuild_graph(  # noqa: C901,PLR0912,PLR0915
                     # if user doesn't specifically handle street_count with an
                     # agg function, just skip it here then calculate it later
                     continue
+                elif col == _merge.PROVENANCE_ATTR:
+                    # source parcels are a union across merged nodes, never a
+                    # list of per-node strings
+                    node_attrs[col] = _merge.merge_provenance(unique_vals)
                 elif len(unique_vals) == 1:
                     # if there's 1 unique value for this attribute, keep it
                     node_attrs[col] = unique_vals[0]

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- merge duplicate boundary elements across sub-query responses by element type and OSM ID before building graphs or features, resolving conflicts with OSM version facts and recording each element's source parcels
+
 ## 2.2.0 (2026-11-18)
 
 - add Python 3.15 support and drop Python 3.11 support (#1416)

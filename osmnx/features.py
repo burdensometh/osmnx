@@ -33,6 +33,7 @@ from shapely.ops import linemerge
 from shapely.ops import polygonize
 from shapely.ops import unary_union
 
+from . import _merge
 from . import _osm_xml
 from . import _overpass
 from . import geocoder
@@ -401,18 +402,33 @@ def _create_gdf(
         GeoDataFrame of features with tags and geometry columns.
     """
     # consume response_jsons generator to download data from server
-    elements = []
+    responses = []
     response_count = 0
     for response_json in response_jsons:
         response_count += 1
         if not settings.cache_only_mode:
-            elements.extend(response_json["elements"])
+            responses.append(response_json)
 
-    msg = f"Retrieved {len(elements):,} elements from API in {response_count} request(s)"
+    msg = f"Retrieved data from API in {response_count} request(s)"
     utils.log(msg, level=lg.INFO)
     if settings.cache_only_mode:
         msg = "Interrupted because `settings.cache_only_mode=True`."
         raise CacheOnlyInterruptError(msg)
+
+    # merge duplicate elements returned by multiple source parcels before
+    # constructing features, so the result is invariant to response order
+    elements, provenance, _ = _merge.merge_osm_elements(responses)
+    msg = f"Retrieved {len(elements):,} elements from API in {response_count} request(s)"
+    utils.log(msg, level=lg.INFO)
+
+    # annotate each element with the source parcels it was observed in, but
+    # only when the data genuinely came from more than one parcel (not for a
+    # single-parcel query or local XML/file input)
+    if _merge.has_multiple_sources(provenance):
+        for element in elements:
+            parcels = provenance.get(_merge._element_key(element))
+            if parcels is not None:
+                element[_merge.PROVENANCE_ATTR] = _merge.format_provenance(parcels)
 
     # convert the elements into a GeoDataFrame of features
     gdf = (
@@ -424,6 +440,9 @@ def _create_gdf(
         .set_index(["element", "id"])
         .sort_index()
     )
+    # drop element metadata collected only for conflict resolution
+    to_drop = set(gdf.columns) & {"changeset", "timestamp", "uid", "user", "version"}
+    gdf = gdf.drop(columns=list(to_drop))
     return _filter_features(gdf, polygon, tags)
 
 

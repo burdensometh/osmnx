@@ -19,6 +19,7 @@ import networkx as nx
 from shapely import MultiPolygon
 from shapely import Polygon
 
+from . import _merge
 from . import _osm_pbf
 from . import _osm_xml
 from . import _overpass
@@ -673,14 +674,23 @@ def _create_graph(
 
     # consume response_jsons generator to download data from server. if
     # cache_only_mode, just consume response_jsons then continue next loop.
-    # otherwise, extract nodes and paths from the downloaded OSM data.
-    response_count = 0
+    # otherwise, merge duplicates by (element type, osmid) then extract nodes
+    # and paths from the merged OSM data. merging first makes the resulting
+    # graph invariant to the order in which responses were returned.
+    responses: list[dict[str, Any]] = []
     for response_json in response_jsons:
-        response_count += 1
-        if not settings.cache_only_mode:
-            nodes_temp, paths_temp = _parse_nodes_paths(response_json)
-            nodes.update(nodes_temp)
-            paths.update(paths_temp)
+        responses.append(response_json)
+
+    response_count = len(responses)
+    if not settings.cache_only_mode and len(responses) > 0:
+        elements, provenance, _ = _merge.merge_osm_elements(responses)
+        # pass provenance only when the data came from more than one parcel:
+        # single-parcel and single-file inputs have no boundary duplicates to
+        # trace, so ordinary small queries remain unannotated
+        nodes, paths = _parse_merged_elements(
+            elements,
+            provenance if _merge.has_multiple_sources(provenance) else None,
+        )
 
     msg = f"Retrieved all data from API in {response_count} request(s)"
     utils.log(msg, level=lg.INFO)
@@ -766,6 +776,54 @@ def _convert_path(element: dict[str, Any]) -> dict[str, Any]:
     return path
 
 
+def _parse_merged_elements(
+    elements: Iterable[dict[str, Any]],
+    provenance: dict[tuple[str, int], list[str]] | None = None,
+) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+    """
+    Construct dicts of nodes and paths from already-merged OSM elements.
+
+    Parameters
+    ----------
+    elements
+        Merged OSM elements, canonically ordered.
+    provenance
+        Optional mapping of `(element_type, osmid)` merge keys to the source
+        parcels they were observed in. When provided, each converted node and
+        path is annotated with a comma-joined string of its source parcels.
+        When None, no provenance is annotated.
+
+    Returns
+    -------
+    nodes, paths
+        Each dict's keys are OSM IDs and values are dicts of attributes.
+    """
+    nodes = {}
+    paths = {}
+    for element in elements:
+        element_type = element["type"]
+        if element_type == "node":
+            nodes[element["id"]] = _convert_node(element)
+        elif element_type == "way":
+            paths[element["id"]] = _convert_path(element)
+
+    if provenance is not None:
+        # annotate each converted node and path with the source parcels it was
+        # observed in. provenance is only passed when the data came from more
+        # than one parcel, so ordinary single-parcel queries stay unannotated.
+        for element in elements:
+            element_type = element["type"]
+            if element_type not in {"node", "way"}:
+                continue
+            parcels = provenance.get((element_type, element["id"]))
+            if parcels is None:  # pragma: no cover
+                continue
+            target = nodes if element_type == "node" else paths
+            target[element["id"]][_merge.PROVENANCE_ATTR] = _merge.format_provenance(parcels)
+
+    return nodes, paths
+
+
 def _parse_nodes_paths(
     response_json: dict[str, Any],
 ) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
@@ -782,15 +840,7 @@ def _parse_nodes_paths(
     nodes, paths
         Each dict's keys are OSM IDs and values are dicts of attributes.
     """
-    nodes = {}
-    paths = {}
-    for element in response_json["elements"]:
-        if element["type"] == "node":
-            nodes[element["id"]] = _convert_node(element)
-        elif element["type"] == "way":
-            paths[element["id"]] = _convert_path(element)
-
-    return nodes, paths
+    return _parse_merged_elements(response_json["elements"])
 
 
 def _is_path_one_way(attrs: dict[str, Any], bidirectional: bool, oneway_values: set[str]) -> bool:  # noqa: FBT001

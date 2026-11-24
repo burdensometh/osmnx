@@ -15,6 +15,7 @@ import requests
 from requests.exceptions import ConnectionError as RequestsConnectionError
 
 from . import _http
+from . import _merge
 from . import projection
 from . import settings
 from . import utils
@@ -390,9 +391,10 @@ def _create_overpass_features_query(  # noqa: PLR0912
             for kind in ("node", "way", "relation"):
                 components.append(f"({kind}{tag_str});")  # noqa: PERF401
 
-    # finalize query and return
+    # finalize query and return. request element metadata ("out meta") so that
+    # each element carries explicit version facts for de-duplication
     components_str = "".join(components)
-    return f"{overpass_settings};({components_str});out;"
+    return f"{overpass_settings};({components_str});out meta;"
 
 
 def _download_overpass_network(
@@ -415,7 +417,8 @@ def _download_overpass_network(
     Yields
     ------
     response_json
-        JSON response from the Overpass server.
+        JSON response from the Overpass server, annotated with the source
+        parcel that produced it under `_merge.SOURCE_KEY`.
     """
     # create filter(s) to exclude certain kinds of ways based on the requested
     # network_type, if provided, otherwise use custom_filter
@@ -437,10 +440,16 @@ def _download_overpass_network(
 
     # pass exterior coordinates of each polygon in list to API, one at a time
     # the '>' makes it recurse so we get ways and the ways' nodes.
-    for polygon_coord_str in polygon_coord_strs:
+    for parcel, polygon_coord_str in enumerate(polygon_coord_strs):
         for way_filter in way_filters:
-            query_str = f"{overpass_settings};(way{way_filter}(poly:{polygon_coord_str!r});>;);out;"
-            yield _overpass_request(OrderedDict(data=query_str))
+            query_str = (
+                f"{overpass_settings};(way{way_filter}(poly:{polygon_coord_str!r});>;);out meta;"
+            )
+            response_json = dict(_overpass_request(OrderedDict(data=query_str)))
+            # label the response with its parcel so duplicates returned by
+            # multiple parcels can be traced back to their sources
+            response_json[_merge.SOURCE_KEY] = f"parcel-{parcel}"
+            yield response_json
 
 
 def _download_overpass_features(
@@ -460,7 +469,8 @@ def _download_overpass_features(
     Yields
     ------
     response_json
-        JSON response from the Overpass server.
+        JSON response from the Overpass server, annotated with the source
+        parcel that produced it under `_merge.SOURCE_KEY`.
     """
     # subdivide query polygon to get list of sub-divided polygon coord strings
     polygon_coord_strs = _make_overpass_polygon_coord_strs(polygon)
@@ -468,9 +478,13 @@ def _download_overpass_features(
     utils.log(msg, level=lg.INFO)
 
     # pass exterior coordinates of each polygon in list to API, one at a time
-    for polygon_coord_str in polygon_coord_strs:
+    for parcel, polygon_coord_str in enumerate(polygon_coord_strs):
         query_str = _create_overpass_features_query(polygon_coord_str, tags)
-        yield _overpass_request(OrderedDict(data=query_str))
+        response_json = dict(_overpass_request(OrderedDict(data=query_str)))
+        # label the response with its parcel so duplicates returned by
+        # multiple parcels can be traced back to their sources
+        response_json[_merge.SOURCE_KEY] = f"parcel-{parcel}"
+        yield response_json
 
 
 def _overpass_request(data: OrderedDict[str, Any]) -> dict[str, Any]:
