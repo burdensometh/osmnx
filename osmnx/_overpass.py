@@ -7,6 +7,7 @@ import logging as lg
 import re
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -19,6 +20,7 @@ from . import projection
 from . import settings
 from . import utils
 from . import utils_geo
+from ._errors import IncompleteCoverageError
 from ._errors import InsufficientResponseError
 
 if TYPE_CHECKING:
@@ -26,6 +28,16 @@ if TYPE_CHECKING:
 
     from shapely import MultiPolygon
     from shapely import Polygon
+
+# how many times to attempt each shard request before marking it failed: the
+# first attempt plus this many retries, each preceded by the service-mandated
+# wait (or a conservative fallback when the status endpoint is unreachable)
+_MAX_REQUEST_ATTEMPTS = 3
+
+# fallback pause (seconds) before retrying when the status endpoint is
+# unreachable or the server cannot be contacted, matching the pause used for
+# retryable HTTP status codes
+_NETWORK_ERROR_PAUSE = 55
 
 
 # define built-in network exclusions once for both Overpass and PBF matching
@@ -288,6 +300,99 @@ def _make_overpass_settings() -> str:
     return settings.overpass_settings.format(timeout=settings.requests_timeout, maxsize=maxsize)
 
 
+@dataclass
+class ShardReceipt:
+    """
+    Plan and outcome of a single shard request in a subdivided query.
+
+    Parameters
+    ----------
+    index
+        Zero-based position of this shard among the planned shards.
+    polygon_coord_str
+        The lat-lon exterior coordinate string sent to Overpass.
+    bounds
+        The shard's expected extent as `(left, bottom, right, top)` in
+        unprojected latitude-longitude degrees (EPSG:4326).
+    response_json
+        The most recent successful Overpass API response for this shard,
+        otherwise None.
+    attempts
+        Number of HTTP attempts made on the most recent request.
+    error
+        The exception raised on the most recent failed attempt, or None.
+    request_count
+        Number of distinct requests planned for this shard (more than one
+        when a list of custom way filters is used).
+    success_count
+        Number of planned requests that returned successfully.
+    """
+
+    index: int
+    polygon_coord_str: str
+    bounds: tuple[float, float, float, float]
+    response_json: dict[str, Any] | None = None
+    attempts: int = 0
+    error: Exception | None = None
+    request_count: int = 0
+    success_count: int = 0
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether every request planned for this shard returned successfully."""
+        return self.request_count > 0 and self.success_count == self.request_count
+
+    @property
+    def failed(self) -> bool:
+        """Whether at least one request planned for this shard is unconfirmed."""
+        return not self.succeeded
+
+
+def _make_overpass_shards(polygon: Polygon | MultiPolygon) -> list[ShardReceipt]:
+    """
+    Subdivide query polygon and plan one `ShardReceipt` per sub-polygon.
+
+    Project to UTM, divide `polygon` up into sub-polygons if area exceeds a
+    max size (in meters), project back to lat-lon, then build a receipt for
+    each sub-polygon recording its expected extent and exterior coordinates.
+    Interior ("holes") coordinates are ignored.
+
+    Parameters
+    ----------
+    polygon
+        The (Multi)Polygon to subdivide into query shards.
+
+    Returns
+    -------
+    shards
+        Planned shard receipts, one per subdivided constituent polygon.
+    """
+    # subdivide the polygon if its area exceeds max size
+    # this results in a multipolygon of 1+ constituent polygons
+    poly_proj, crs_proj = projection.project_geometry(polygon)
+    multi_poly_proj = utils_geo._consolidate_subdivide_geometry(poly_proj)
+    multi_poly, _ = projection.project_geometry(multi_poly_proj, crs=crs_proj, to_latlong=True)
+
+    # extract each shard's extent and exterior coords in the string format
+    # Overpass expects, rounding lats and lons to 6 decimals (approx 5 to 10
+    # cm resolution) so we can hash and cache URL strings consistently
+    shards = []
+    for index, geom in enumerate(multi_poly.geoms):
+        x, y = geom.exterior.xy
+        coord_list = [f"{xy[1]:.6f}{' '}{xy[0]:.6f}" for xy in zip(x, y, strict=True)]
+        polygon_coord_str = " ".join(coord_list)
+        left, bottom, right, top = geom.bounds
+        shards.append(
+            ShardReceipt(
+                index=index,
+                polygon_coord_str=polygon_coord_str,
+                bounds=(left, bottom, right, top),
+            )
+        )
+
+    return shards
+
+
 def _make_overpass_polygon_coord_strs(polygon: Polygon | MultiPolygon) -> list[str]:
     """
     Subdivide query polygon and return list of coordinate strings.
@@ -306,22 +411,7 @@ def _make_overpass_polygon_coord_strs(polygon: Polygon | MultiPolygon) -> list[s
     coord_strs
         Exterior coordinates of polygon(s).
     """
-    # subdivide the polygon if its area exceeds max size
-    # this results in a multipolygon of 1+ constituent polygons
-    poly_proj, crs_proj = projection.project_geometry(polygon)
-    multi_poly_proj = utils_geo._consolidate_subdivide_geometry(poly_proj)
-    multi_poly, _ = projection.project_geometry(multi_poly_proj, crs=crs_proj, to_latlong=True)
-
-    # then extract each's exterior coords to the string format Overpass
-    # expects, rounding lats and lons to 6 decimals (approx 5 to 10 cm
-    # resolution) so we can hash and cache URL strings consistently
-    coord_strs = []
-    for geom in multi_poly.geoms:
-        x, y = geom.exterior.xy
-        coord_list = [f"{xy[1]:.6f}{' '}{xy[0]:.6f}" for xy in zip(x, y, strict=True)]
-        coord_strs.append(" ".join(coord_list))
-
-    return coord_strs
+    return [shard.polygon_coord_str for shard in _make_overpass_shards(polygon)]
 
 
 def _create_overpass_features_query(  # noqa: PLR0912
@@ -403,6 +493,12 @@ def _download_overpass_network(
     """
     Retrieve networked ways and nodes within boundary from the Overpass API.
 
+    The boundary is subdivided into planned shards. Every shard must return
+    successfully for the full-area result to be considered complete: if any
+    shard still fails after all allowed retries, an `IncompleteCoverageError`
+    is raised identifying the failed shards. Responses for successful shards
+    are cached, so re-running after a failure resumes from the failed shards.
+
     Parameters
     ----------
     polygon
@@ -415,7 +511,8 @@ def _download_overpass_network(
     Yields
     ------
     response_json
-        JSON response from the Overpass server.
+        JSON response from the Overpass server, one per successful shard and
+        way filter.
     """
     # create filter(s) to exclude certain kinds of ways based on the requested
     # network_type, if provided, otherwise use custom_filter
@@ -430,17 +527,24 @@ def _download_overpass_network(
     # create overpass settings string
     overpass_settings = _make_overpass_settings()
 
-    # subdivide query polygon to get list of sub-divided polygon coord strings
-    polygon_coord_strs = _make_overpass_polygon_coord_strs(polygon)
-    msg = f"Requesting data from API in {len(polygon_coord_strs)} request(s)"
-    utils.log(msg, level=lg.INFO)
+    # subdivide query polygon into planned shards with expected extents
+    shards = _plan_shards(polygon)
 
-    # pass exterior coordinates of each polygon in list to API, one at a time
-    # the '>' makes it recurse so we get ways and the ways' nodes.
-    for polygon_coord_str in polygon_coord_strs:
+    # request each shard, one at a time. the '>' makes it recurse so we get
+    # ways and the ways' nodes. each shard is fully resolved (all its way
+    # filters) before it counts as covered: a single failed filter leaves
+    # `shard.failed` True, so nothing is yielded for an incomplete shard.
+    for shard in shards:
+        shard_responses: list[dict[str, Any]] = []
         for way_filter in way_filters:
-            query_str = f"{overpass_settings};(way{way_filter}(poly:{polygon_coord_str!r});>;);out;"
-            yield _overpass_request(OrderedDict(data=query_str))
+            query_str = f"{overpass_settings};(way{way_filter}(poly:{shard.polygon_coord_str!r});>;);out;"
+            response_json = _request_shard(shard, OrderedDict(data=query_str))
+            if response_json is not None:
+                shard_responses.append(response_json)
+        if shard.succeeded:
+            yield from shard_responses
+
+    _verify_complete_coverage(shards)
 
 
 def _download_overpass_features(
@@ -449,6 +553,12 @@ def _download_overpass_features(
 ) -> Iterator[dict[str, Any]]:
     """
     Retrieve OSM features within some boundary polygon from the Overpass API.
+
+    The boundary is subdivided into planned shards. Every shard must return
+    successfully for the full-area result to be considered complete: if any
+    shard still fails after all allowed retries, an `IncompleteCoverageError`
+    is raised identifying the failed shards. Responses for successful shards
+    are cached, so re-running after a failure resumes from the failed shards.
 
     Parameters
     ----------
@@ -460,22 +570,193 @@ def _download_overpass_features(
     Yields
     ------
     response_json
-        JSON response from the Overpass server.
+        JSON response from the Overpass server, one per successful shard.
     """
-    # subdivide query polygon to get list of sub-divided polygon coord strings
-    polygon_coord_strs = _make_overpass_polygon_coord_strs(polygon)
-    msg = f"Requesting data from API in {len(polygon_coord_strs)} request(s)"
-    utils.log(msg, level=lg.INFO)
+    # subdivide query polygon into planned shards with expected extents
+    shards = _plan_shards(polygon)
 
-    # pass exterior coordinates of each polygon in list to API, one at a time
-    for polygon_coord_str in polygon_coord_strs:
-        query_str = _create_overpass_features_query(polygon_coord_str, tags)
-        yield _overpass_request(OrderedDict(data=query_str))
+    # pass exterior coordinates of each shard to API, one at a time
+    for shard in shards:
+        query_str = _create_overpass_features_query(shard.polygon_coord_str, tags)
+        response_json = _request_shard(shard, OrderedDict(data=query_str))
+        if response_json is not None:
+            yield response_json
+
+    _verify_complete_coverage(shards)
+
+
+def _plan_shards(polygon: Polygon | MultiPolygon) -> list[ShardReceipt]:
+    """
+    Subdivide a polygon into planned query shards and log their extents.
+
+    Parameters
+    ----------
+    polygon
+        The boundary to subdivide into query shards.
+
+    Returns
+    -------
+    shards
+        Planned shard receipts, each recording its index and expected extent.
+    """
+    shards = _make_overpass_shards(polygon)
+    msg = f"Requesting data from API in {len(shards)} request(s)"
+    utils.log(msg, level=lg.INFO)
+    for shard in shards:
+        left, bottom, right, top = shard.bounds
+        msg = (
+            f"Planned shard {shard.index + 1} of {len(shards)} with extent "
+            f"(left={left:.6f}, bottom={bottom:.6f}, right={right:.6f}, top={top:.6f})"
+        )
+        utils.log(msg, level=lg.INFO)
+    return shards
+
+
+def _request_shard(
+    shard: ShardReceipt,
+    data: OrderedDict[str, Any],
+) -> dict[str, Any] | None:
+    """
+    Execute one shard request, retrying transient network failures.
+
+    Mutates `shard` in place to record the plan, attempts, last error, and a
+    successful response. Successful responses are written to the local HTTP
+    cache by `_overpass_request`, so a later re-run of the same query resumes
+    from failed shards instead of re-downloading the confirmed coverage.
+
+    Parameters
+    ----------
+    shard
+        The planned shard receipt to request.
+    data
+        Key-value pairs of parameters for the Overpass request.
+
+    Returns
+    -------
+    response_json
+        The Overpass API response, or None if every attempt failed. A None
+        result leaves `shard.failed` True so the caller never treats the
+        full-area result as complete.
+    """
+    shard.request_count += 1
+    for attempt in range(1, _MAX_REQUEST_ATTEMPTS + 1):
+        shard.attempts = attempt
+        try:
+            response_json = _overpass_request(data)
+
+        except RequestsConnectionError as e:
+            # transient network failure: honor the service's prescribed wait
+            # (or a conservative fallback), then retry until attempts exhaust
+            shard.error = e
+            if attempt < _MAX_REQUEST_ATTEMPTS:
+                pause = _get_retry_pause(settings.overpass_url, repr(e))
+                msg = (
+                    f"Shard {shard.index + 1} attempt {attempt} of "
+                    f"{_MAX_REQUEST_ATTEMPTS} failed ({e!r}): retrying in {pause} secs"
+                )
+                utils.log(msg, level=lg.WARNING)
+                time.sleep(pause)
+            continue
+
+        # success: record the receipt and log the confirmed coverage
+        shard.response_json = response_json
+        shard.error = None
+        shard.success_count += 1
+        left, bottom, right, top = shard.bounds
+        msg = (
+            f"Received shard {shard.index + 1} response covering extent "
+            f"(left={left:.6f}, bottom={bottom:.6f}, right={right:.6f}, top={top:.6f}) "
+            f"on attempt {attempt}"
+        )
+        utils.log(msg, level=lg.INFO)
+        return response_json
+
+    # all attempts failed: the shard stays marked failed and returns no data
+    msg = (
+        f"Shard {shard.index + 1} failed after {shard.attempts} attempt(s): "
+        f"{shard.error!r}"
+    )
+    utils.log(msg, level=lg.ERROR)
+    return None
+
+
+def _get_retry_pause(base_endpoint: str, reason: str) -> float:
+    """
+    Determine how long to wait before retrying a failed shard request.
+
+    Use the pause mandated by the Overpass status endpoint when reachable,
+    otherwise fall back on a conservative default because a transient network
+    failure prevented reading the server's slot timing.
+
+    Parameters
+    ----------
+    base_endpoint
+        Base Overpass API URL (without "/status" at the end).
+    reason
+        Description of the failure that triggered the retry.
+
+    Returns
+    -------
+    pause
+        Seconds to wait before the next attempt.
+    """
+    pause = _get_overpass_pause(base_endpoint, default_pause=_NETWORK_ERROR_PAUSE)
+    if pause <= 0:
+        # status endpoint reported a free slot, but the request itself failed:
+        # still back off briefly before retrying
+        msg = f"Status endpoint reports no wait after {reason}; backing off {_NETWORK_ERROR_PAUSE} secs"
+        utils.log(msg, level=lg.WARNING)
+        pause = _NETWORK_ERROR_PAUSE
+    return pause
+
+
+def _verify_complete_coverage(shards: list[ShardReceipt]) -> None:
+    """
+    Confirm every planned shard returned successfully, or raise if not.
+
+    Never report a full-area result when any shard is missing. The caller can
+    fix the network/service problem and re-run the same query: successful
+    shards are served from the local cache and only the failed shards are
+    requested again.
+
+    Parameters
+    ----------
+    shards
+        Shard receipts covering the whole subdivided query area.
+
+    Raises
+    ------
+    IncompleteCoverageError
+        If one or more planned shards do not have a successful response.
+    """
+    failed = [shard for shard in shards if shard.failed]
+    if failed:
+        descriptions = [
+            f"shard {shard.index + 1} (extent {shard.bounds}, "
+            f"attempts {shard.attempts}, error {shard.error!r})"
+            for shard in failed
+        ]
+        msg = (
+            f"Incomplete coverage: {len(failed)} of {len(shards)} planned "
+            f"shard(s) did not return successfully: {'; '.join(descriptions)}. "
+            "Successful shards are cached; re-run the same query to resume "
+            "from the failed shards."
+        )
+        raise IncompleteCoverageError(msg)
+
+    msg = f"All {len(shards)} planned shard(s) confirmed: full-area coverage complete"
+    utils.log(msg, level=lg.INFO)
 
 
 def _overpass_request(data: OrderedDict[str, Any]) -> dict[str, Any]:
     """
     Send a HTTP POST request to the Overpass API and return response.
+
+    Retryable HTTP status codes (429, 502, 504) are retried indefinitely
+    after pausing, matching the server's slot management. Connection-level
+    failures (e.g. the network is temporarily unavailable) are propagated to
+    the caller, where the shard retrier handles them so that exhausted
+    shards can be tracked and resumed rather than silently dropped.
 
     Parameters
     ----------

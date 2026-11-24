@@ -11,12 +11,14 @@ import matplotlib as mpl
 mpl.use("Agg")
 
 import bz2
+import dataclasses
 import gzip
 import logging as lg
 import os
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
+from unittest.mock import patch
 
 import geopandas as gpd
 import networkx as nx
@@ -92,6 +94,9 @@ def test_exceptions() -> None:
 
     with pytest.raises(ox._errors.InsufficientResponseError):
         raise ox._errors.InsufficientResponseError(message)
+
+    with pytest.raises(ox._errors.IncompleteCoverageError):
+        raise ox._errors.IncompleteCoverageError(message)
 
     with pytest.raises(ox._errors.ResponseStatusCodeError):
         raise ox._errors.ResponseStatusCodeError(message)
@@ -513,6 +518,147 @@ def test_network_filters() -> None:
         matches("invalid", {})
 
 
+@pytest.mark.xdist_group(name="group0")
+def test_overpass_shards() -> None:
+    """Test shard planning, receipts, retries, resume, and coverage guarantees."""
+    # an area larger than max_query_area_size gets subdivided into many shards
+    big_polygon = ox.utils_geo.bbox_to_poly((-123.6, 36.6, -121.2, 39.0))
+    planned_shards = ox._overpass._make_overpass_shards(big_polygon)
+    assert len(planned_shards) > 1
+    for shard in planned_shards:
+        left, bottom, right, top = shard.bounds
+        assert right > left
+        assert top > bottom
+        assert shard.polygon_coord_str
+        assert shard.failed
+        assert not shard.succeeded
+        assert shard.request_count == 0
+
+    # the legacy coord-string helper returns one coord string per shard
+    coord_strs = ox._overpass._make_overpass_polygon_coord_strs(big_polygon)
+    assert len(coord_strs) == len(planned_shards)
+    assert coord_strs == [shard.polygon_coord_str for shard in planned_shards]
+
+    # a small area produces a single shard
+    small_polygon = ox.utils_geo.bbox_to_poly((-122.42, 37.78, -122.40, 37.80))
+    assert len(ox._overpass._make_overpass_shards(small_polygon)) == 1
+
+    # reuse the already-computed subdivision inside every downloader instead
+    # of re-projecting and re-cutting the geometry on each call
+    def fake_plan_shards(_polygon: object) -> list[ox._overpass.ShardReceipt]:
+        return [dataclasses.replace(shard) for shard in planned_shards]
+
+    n_shards = len(planned_shards)
+
+    # every planned shard returning -> all responses yielded, coverage complete
+    def fake_ok(_data: object) -> dict[str, object]:
+        return {"elements": []}
+
+    with (
+        patch.object(ox._overpass, "_make_overpass_shards", side_effect=fake_plan_shards),
+        patch.object(ox._overpass, "_overpass_request", side_effect=fake_ok),
+        patch.object(ox._overpass.time, "sleep"),
+    ):
+        responses = list(
+            ox._overpass._download_overpass_features(big_polygon, {"building": True})
+        )
+    assert len(responses) == n_shards
+
+    # one shard always fails -> partial coverage retained, full area never marked
+    bad_coord = planned_shards[1].polygon_coord_str
+
+    def fake_partial(data: OrderedDict[str, str]) -> dict[str, object]:
+        if bad_coord in data["data"]:
+            raise RequestsConnectionError("simulated outage")
+        return {"elements": []}
+
+    with (
+        patch.object(ox._overpass, "_make_overpass_shards", side_effect=fake_plan_shards),
+        patch.object(ox._overpass, "_overpass_request", side_effect=fake_partial),
+        patch.object(ox._overpass.time, "sleep") as fake_sleep,
+    ):
+        partial_responses: list[dict[str, object]] = []
+        generator = ox._overpass._download_overpass_features(
+            big_polygon, {"building": True}
+        )
+        with pytest.raises(ox._errors.IncompleteCoverageError, match="shard 2"):
+            while True:
+                partial_responses.append(next(generator))
+        # the failed shard exhausted every attempt, waiting before each retry
+        assert fake_sleep.call_count == ox._overpass._MAX_REQUEST_ATTEMPTS - 1
+    # successful shards before the failure were still yielded (coverage retained)
+    assert len(partial_responses) == n_shards - 1
+
+    # transient failures that recover still complete the coverage
+    attempts = {"n": 0}
+
+    def fake_flaky(_data: object) -> dict[str, object]:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise RequestsConnectionError("transient")
+        return {"elements": []}
+
+    with (
+        patch.object(ox._overpass, "_overpass_request", side_effect=fake_flaky),
+        patch.object(ox._overpass.time, "sleep"),
+    ):
+        responses = list(
+            ox._overpass._download_overpass_features(small_polygon, {"building": True})
+        )
+    assert len(responses) == 1
+    assert attempts["n"] == 3
+
+    # with multiple way filters, one failed filter leaves the shard incomplete
+    filters = ['["highway"~"motorway"]', '["highway"~"primary"]']
+
+    def fake_filter_fail(data: OrderedDict[str, str]) -> dict[str, object]:
+        if "primary" in data["data"]:
+            raise RequestsConnectionError("down")
+        return {"elements": []}
+
+    with (
+        patch.object(ox._overpass, "_overpass_request", side_effect=fake_filter_fail),
+        patch.object(ox._overpass.time, "sleep"),
+    ):
+        with pytest.raises(ox._errors.IncompleteCoverageError):
+            list(ox._overpass._download_overpass_network(small_polygon, "drive", filters))
+
+    # resume: cached shards are not re-requested, only the failed shard is retried
+    cache: dict[str, dict[str, object]] = {}
+    network_calls = {"n": 0}
+
+    def fake_cached(data: OrderedDict[str, str]) -> dict[str, object]:
+        import requests
+
+        url = ox.settings.overpass_url.rstrip("/") + "/interpreter"
+        prepared_url = str(requests.Request("GET", url, params=data).prepare().url)
+        if prepared_url in cache:
+            return cache[prepared_url]
+        network_calls["n"] += 1
+        if bad_coord in data["data"] and not getattr(fake_cached, "second_run", False):
+            raise RequestsConnectionError("outage")
+        response = {"elements": []}
+        cache[prepared_url] = response
+        return response
+
+    with (
+        patch.object(ox._overpass, "_make_overpass_shards", side_effect=fake_plan_shards),
+        patch.object(ox._overpass, "_overpass_request", side_effect=fake_cached),
+        patch.object(ox._overpass.time, "sleep"),
+    ):
+        with pytest.raises(ox._errors.IncompleteCoverageError):
+            list(ox._overpass._download_overpass_features(big_polygon, {"building": True}))
+        first_run_calls = network_calls["n"]
+        fake_cached.second_run = True  # type: ignore[attr-defined]
+        responses = list(
+            ox._overpass._download_overpass_features(big_polygon, {"building": True})
+        )
+
+    # second run makes exactly one new network call: the previously failed shard
+    assert network_calls["n"] == first_run_calls + 1
+    assert len(responses) == n_shards
+
+
 @pytest.mark.xdist_group(name="group1")
 def test_pbf() -> None:
     """Test loading graphs from PBF files."""
@@ -821,10 +967,13 @@ def test_endpoints() -> None:
         ip = ox._http._resolve_host_via_doh("overpass-api.de")
 
         # Test changing the Overpass endpoint.
-        # This should fail because we didn't provide a valid endpoint
+        # This should fail because we didn't provide a valid endpoint:
+        # every shard exhausts its retries and coverage is never marked
+        # complete, so an IncompleteCoverageError is raised (never a
+        # partial graph silently presented as full-area)
         ox.settings.overpass_rate_limit = False
         ox.settings.overpass_url = "http://NOT_A_VALID_ENDPOINT/api/"
-        with pytest.raises(RequestsConnectionError, match="Max retries exceeded with url"):
+        with pytest.raises(ox._errors.IncompleteCoverageError, match="Incomplete coverage"):
             G = ox.graph_from_place(place1, network_type="all")
 
         ox.settings.doh_url_template = default_doh_url_template

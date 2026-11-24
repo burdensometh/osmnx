@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- track subdivided Overpass queries as shards with per-shard expected extents and receipts
+- retry transient connection failures per shard using the service-prescribed wait
+- raise `IncompleteCoverageError` if any planned shard fails, so partial data is never marked full-area
+- preserve successful shard coverage in the cache and resume from failed shards on re-run
+
 ## 2.2.0 (2026-11-18)
 
 - add Python 3.15 support and drop Python 3.11 support (#1416)
