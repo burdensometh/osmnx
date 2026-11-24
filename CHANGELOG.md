@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- strictly reconstruct relation geometries from their member ways: flag relations with missing segments or non-uniquely-owned holes for repair instead of silently building partial geometries, while member reversal or reordering no longer changes the resulting shape
+
 ## 2.2.0 (2026-11-18)
 
 - add Python 3.15 support and drop Python 3.11 support (#1416)

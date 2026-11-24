@@ -23,14 +23,11 @@ from typing import Any
 import geopandas as gpd
 import pandas as pd
 from shapely import LineString
-from shapely import MultiLineString
 from shapely import MultiPolygon
 from shapely import Point
 from shapely import Polygon
 from shapely import prepare
 from shapely.errors import GEOSException
-from shapely.ops import linemerge
-from shapely.ops import polygonize
 from shapely.ops import unary_union
 
 from . import _osm_xml
@@ -595,11 +592,13 @@ def _build_relation_geometry(
     inner_polygons = []
     outer_polygons = []
 
-    # sort member geometries by member role and geometry type
+    # sort member geometries by member role and geometry type. each relation
+    # retains its own copy of its members' roles, so a way shared between two
+    # relations keeps whichever role each relation assigned to it.
     for member in members:
         if member["type"] == "way":
             geom = way_geoms.get(member["ref"])
-            if geom is None:
+            if geom is None or geom.is_empty:
                 # a member's geometry may be missing when loaded from XML, if
                 # so, we cannot build this relation's complete geometry, so
                 # just return a null geometry to be removed at final filtering
@@ -616,22 +615,129 @@ def _build_relation_geometry(
             elif role == "inner" and geom.geom_type == "Polygon":
                 inner_polygons.append(geom)
 
-    # merge/polygonize outer linestring fragments then add to outer polygons
-    merged_outer_linestrings = linemerge(outer_linestrings)
-    if merged_outer_linestrings.geom_type == "LineString":
-        merged_outer_linestrings = MultiLineString([merged_outer_linestrings])
-    for merged_outer_linestring in merged_outer_linestrings.geoms:
-        outer_polygons += polygonize(merged_outer_linestring)
+    # assemble outer and inner fragments into closed rings. a hole belongs
+    # only to an outer ring that contains it, and the assignment must be
+    # unique: a relation with missing segments or an ambiguously-owned hole
+    # cannot be reconstructed, so return a null geometry to be removed at
+    # final filtering and left for repair.
+    assembled_outer = _assemble_ring_polygons(outer_linestrings)
+    assembled_inner = _assemble_ring_polygons(inner_linestrings)
+    if assembled_outer is None or assembled_inner is None:
+        msg = "Cannot build relation geometry: members do not form closed rings."
+        utils.log(msg, level=lg.WARNING)
+        return Polygon()
+    outer_polygons += assembled_outer
+    inner_polygons += assembled_inner
 
-    # merge/polygonize inner linestring fragments then add to inner polygons
-    merged_inner_linestrings = linemerge(inner_linestrings)
-    if merged_inner_linestrings.geom_type == "LineString":
-        merged_inner_linestrings = MultiLineString([merged_inner_linestrings])
-    for merged_inner_linestring in merged_inner_linestrings.geoms:
-        inner_polygons += polygonize(merged_inner_linestring)
+    if len(outer_polygons) == 0:
+        msg = "Cannot build relation geometry: no outer ring."
+        utils.log(msg, level=lg.WARNING)
+        return Polygon()
 
-    # remove holes from polygons, if any, then retun
+    # every hole must be contained by exactly one outer ring
+    for outer in outer_polygons:
+        prepare(outer)
+    for inner in inner_polygons:
+        owners = [outer for outer in outer_polygons if outer.contains(inner)]
+        if len(owners) != 1:
+            msg = "Cannot build relation geometry: a hole has no unique outer ring."
+            utils.log(msg, level=lg.WARNING)
+            return Polygon()
+
+    # remove holes from polygons, if any, then return
     return _remove_polygon_holes(outer_polygons, inner_polygons)
+
+
+def _assemble_ring_polygons(
+    linestrings: list[LineString],
+) -> list[Polygon] | None:
+    """
+    Assemble member way fragments into closed rings and polygonize them.
+
+    Member ways may be listed in any order and in either direction: fragments
+    are stitched together at their shared endpoints, reversing a fragment when
+    needed, so reversing a member or reordering members never changes the
+    resulting shape. Every fragment must end up in a closed ring; if any
+    fragment is left dangling (for example, because a segment is missing), the
+    relation cannot be reconstructed and ``None`` is returned so the caller
+    can flag it for repair rather than silently building a partial geometry.
+
+    Parameters
+    ----------
+    linestrings
+        The member way line geometries of a single role (outer or inner).
+
+    Returns
+    -------
+    polygons
+        The closed rings as polygons, or ``None`` if the fragments cannot be
+        assembled into complete closed rings. An empty input returns an empty
+        list, as a relation need not have any inner rings.
+    """
+    if len(linestrings) == 0:
+        return []
+
+    # keep already-complete rings intact; open the other fragments by dropping
+    # their auto-closing duplicate endpoint so they can be stitched together
+    complete_rings: list[list[tuple[float, float]]] = []
+    fragments: list[list[tuple[float, float]]] = []
+    for linestring in linestrings:
+        coords = list(linestring.coords)
+        if coords[0] == coords[-1] and len(set(coords)) >= 4:
+            complete_rings.append(coords)
+        else:
+            fragments.append(coords[:-1] if coords[0] == coords[-1] else coords)
+
+    rings = list(complete_rings)
+    consumed = [False] * len(fragments)
+
+    # grow a ring from each unconsumed fragment by stitching any fragment that
+    # continues from its current endpoint, in either direction
+    for start in range(len(fragments)):
+        if consumed[start]:
+            continue
+        consumed[start] = True
+        ring = list(fragments[start])
+        while ring[0] != ring[-1]:
+            found = False
+            for j, fragment in enumerate(fragments):
+                if consumed[j]:
+                    continue
+                endpoint = ring[-1]
+                if fragment[0] == endpoint:
+                    # fragment continues in its listed direction
+                    ring.extend(fragment[1:])
+                    consumed[j] = True
+                    found = True
+                    break
+                if fragment[-1] == endpoint:
+                    # fragment continues when traversed in reverse
+                    ring.extend(list(reversed(fragment))[1:])
+                    consumed[j] = True
+                    found = True
+                    break
+            if not found:
+                # a dangling fragment remains: a segment is missing, so the
+                # relation's geometry cannot be completely reconstructed
+                return None
+        rings.append(ring)
+
+    if not all(consumed):
+        return None
+
+    polygons = []
+    for ring in rings:
+        # a valid ring needs at least 3 distinct vertices and a non-zero area
+        if len(set(ring)) < 3:
+            return None
+        try:
+            polygon = Polygon(ring)
+        except (GEOSException, ValueError):
+            return None
+        if not polygon.is_valid or polygon.area == 0:
+            return None
+        polygons.append(polygon)
+    return polygons
 
 
 def _remove_polygon_holes(

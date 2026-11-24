@@ -26,6 +26,7 @@ import pandas as pd
 import pytest
 from lxml import etree
 from requests.exceptions import ConnectionError as RequestsConnectionError
+from shapely import LineString
 from shapely import Point
 from shapely import Polygon
 from shapely import wkt
@@ -1115,3 +1116,90 @@ def test_features() -> None:
         "((2.5 2.5, 2.5 1.5, 1.5 1.5, 1.5 2.5, 2.5 2.5)))"
     )
     assert result.equals(wkt.loads(geom_wkt))
+
+
+def test_relation_geometry_reconstruction() -> None:
+    # Two adjacent polygons share a single sub-way (way 102). Each relation
+    # keeps its own member roles, so the shared way is "outer" in both. The
+    # first relation's hole is split across two fragments listed in reverse.
+    coords = {
+        1: (0.0, 0.0), 2: (4.0, 0.0), 3: (8.0, 0.0), 4: (8.0, 4.0),
+        5: (4.0, 4.0), 6: (0.0, 4.0),
+        7: (1.0, 1.0), 8: (2.0, 1.0), 9: (2.0, 2.0), 10: (1.0, 2.0),
+        # a hole straddling the shared edge x=4, owned by neither ring alone
+        11: (3.0, 2.0), 12: (5.0, 2.0), 13: (5.0, 3.0), 14: (3.0, 3.0),
+    }
+
+    def linestring(node_ids: list[int]) -> LineString:
+        pts = [coords[n] for n in node_ids]
+        return LineString([*pts, pts[0]])
+
+    way_geoms = {
+        101: linestring([1, 2]), 102: linestring([2, 5]),
+        103: linestring([2, 3]), 104: linestring([3, 4]),
+        105: linestring([4, 5]), 106: linestring([5, 6]),
+        107: linestring([6, 1]), 108: linestring([7, 8, 9]),
+        109: linestring([7, 10, 9]), 110: linestring([11, 12]),
+        111: linestring([12, 13]), 112: linestring([13, 14]),
+        113: linestring([14, 11]),
+    }
+
+    def member(ref: int, role: str) -> dict[str, str | int]:
+        return {"type": "way", "ref": ref, "role": role}
+
+    outer_a = [member(101, "outer"), member(102, "outer"),
+               member(106, "outer"), member(107, "outer")]
+    outer_b = [member(102, "outer"), member(103, "outer"),
+               member(104, "outer"), member(105, "outer")]
+    good_hole = [member(108, "inner"), member(109, "inner")]
+    ambiguous_hole = [member(110, "inner"), member(111, "inner"),
+                      member(112, "inner"), member(113, "inner")]
+
+    # complete relations reconstruct correctly: hole belongs only to ring A
+    geom_a = ox.features._build_relation_geometry([*outer_a, *good_hole], way_geoms)
+    geom_b = ox.features._build_relation_geometry(outer_b, way_geoms)
+    assert geom_a.area == 15.0 and len(geom_a.interiors) == 1
+    assert geom_b.area == 16.0
+
+    # reversing members and listing them out of order does not change shape
+    reversed_a = [
+        member(107, "outer"), member(106, "outer"),
+        member(102, "outer"), member(101, "outer"),
+        member(109, "inner"), member(108, "inner"),
+    ]
+    geom_a_reversed = ox.features._build_relation_geometry(reversed_a, way_geoms)
+    assert geom_a_reversed.equals(geom_a)
+
+    # missing segment leaves a dangling fragment -> null geometry for repair
+    broken_b = ox.features._build_relation_geometry(outer_b, {k: v for k, v in way_geoms.items() if k != 103})
+    assert broken_b.is_empty
+    broken_a = ox.features._build_relation_geometry(
+        [*outer_a, member(108, "inner")], way_geoms
+    )
+    assert broken_a.is_empty
+
+    # a hole without a unique owning outer ring -> null geometry for repair,
+    # while the other relation sharing the sub-way still reconstructs
+    ambiguous_a = ox.features._build_relation_geometry(
+        [*outer_a, *ambiguous_hole], way_geoms
+    )
+    assert ambiguous_a.is_empty
+    assert ox.features._build_relation_geometry(outer_b, way_geoms).area == 16.0
+
+    # the two reconstruction paths (initial+correction vs final data) agree
+    corrected_a = ox.features._build_relation_geometry([*outer_a, *good_hole], way_geoms)
+    assert corrected_a.equals(geom_a)
+
+    # a closed-way Polygon member is used directly as a ring
+    polygon_outer = Polygon([(0, 0), (4, 0), (4, 4), (0, 4)])
+    polygon_hole = Polygon([(1, 1), (2, 1), (2, 2), (1, 2)])
+    polygon_members = [member(1, "outer"), member(2, "inner")]
+    geom_poly = ox.features._build_relation_geometry(
+        polygon_members, {1: polygon_outer, 2: polygon_hole}
+    )
+    assert geom_poly.area == 15.0 and len(geom_poly.interiors) == 1
+
+    # a hole contained by two outer rings is ambiguously owned -> repair
+    duplicate_outer = {1: polygon_outer, 3: polygon_outer, 2: polygon_hole}
+    duplicate_members = [member(1, "outer"), member(3, "outer"), member(2, "inner")]
+    assert ox.features._build_relation_geometry(duplicate_members, duplicate_outer).is_empty
