@@ -12,9 +12,11 @@ mpl.use("Agg")
 
 import bz2
 import gzip
+import hashlib
 import logging as lg
 import os
 import tempfile
+import types
 from collections import OrderedDict
 from pathlib import Path
 
@@ -626,13 +628,123 @@ def test_elevation() -> None:
 
     # add node elevations from multiple raster files (no nodes should be null)
     G = ox.elevation.add_node_elevations_raster(G, rasters)
-    assert pd.notna(pd.Series(dict(G.nodes(data="elevation")))).all()
+    elevations = pd.Series(dict(G.nodes(data="elevation")))
+    assert pd.notna(elevations).all()
+
+    # every resolved node cites a source raster and each source is versioned
+    sources = pd.Series(dict(G.nodes(data="elevation_src")))
+    assert set(sources.dropna()).issubset({str(r) for r in rasters})
+    assert set(G.graph["elevation_versions"]) == {str(r) for r in rasters}
 
     # consolidate nodes with elevation (by default will aggregate via mean)
     G = ox.simplification.consolidate_intersections(G)
 
     # add edge grades and their absolute values
     G = ox.add_edge_grades(G, add_absolute=True)
+
+
+class _FakeRaster:
+    """In-memory stand-in for a rasterio dataset used by the elevation tests."""
+
+    def __init__(self, values: dict[tuple[float, float], float], nodata: float = -9999.0) -> None:
+        self._values = values
+        self.nodata = nodata
+
+    def sample(self, coords, band):  # noqa: ANN001
+        return [[self._values.get((float(x), float(y)), self.nodata)] for x, y in coords]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> bool:
+        return False
+
+
+def _fake_rasterio(monkeypatch, rasters: dict) -> None:
+    """Inject a fake rasterio module whose open() dispatches by filepath."""
+    fake = types.ModuleType("rasterio")
+    fake.open = lambda filepath: _FakeRaster(rasters[Path(filepath)])
+    monkeypatch.setitem(sys.modules, "rasterio", fake)
+    monkeypatch.setattr(ox.elevation, "rasterio", fake)
+
+
+def _elevation_test_graph() -> nx.MultiDiGraph:
+    """Build a tiny graph of 4 collinear nodes connected by length-10 edges."""
+    G = nx.MultiDiGraph(crs="epsg:4326")
+    for node in range(4):
+        G.add_node(node, x=float(node), y=0.0)
+    for u, v in [(0, 1), (1, 2), (2, 3), (1, 3)]:
+        G.add_edge(u, v, length=10.0)
+    return G
+
+
+@pytest.mark.xdist_group(name="group0")
+def test_elevation_raster_priority(monkeypatch, tmp_path) -> None:
+    """Test priority-ordered raster merge, provenance, and grade revocation."""
+    # high-priority raster: nodata gap at node 1, overlaps low raster at node 2
+    high = tmp_path / "dem_high.tif"
+    low = tmp_path / "dem_low.tif"
+    high.write_text("high")
+    low.write_text("low")
+    rasters = {
+        high: {(0.0, 0.0): 100.0, (1.0, 0.0): np.nan, (2.0, 0.0): 200.0},
+        low: {(1.0, 0.0): 50.0, (2.0, 0.0): 999.0, (3.0, 0.0): 300.0},
+    }
+    _fake_rasterio(monkeypatch, rasters)
+
+    G = _elevation_test_graph()
+    G = ox.elevation.add_node_elevations_raster(G, [high, low], cpus=1)
+    assert G.nodes[0]["elevation"] == 100.0
+    assert G.nodes[1]["elevation"] == 50.0  # falls back past high-priority nodata
+    assert G.nodes[2]["elevation"] == 200.0  # high-priority value wins over overlap
+    assert G.nodes[3]["elevation"] == 300.0  # only present in low-priority raster
+
+    # provenance points at the raster that actually supplied each value and
+    # graph-level checksums version the exact files sampled
+    assert G.nodes[0]["elevation_src"] == str(high)
+    assert G.nodes[1]["elevation_src"] == str(low)
+    assert G.nodes[3]["elevation_src"] == str(low)
+    versions = G.graph["elevation_versions"]
+    assert set(versions) == {str(high), str(low)}
+    assert versions[str(high)] == hashlib.sha256(high.read_bytes()).hexdigest()
+
+    # from-scratch merge and an incremental replay must produce identical
+    # elevations, provenance, and directed grades
+    G_inc = _elevation_test_graph()
+    G_inc = ox.elevation.add_node_elevations_raster(G_inc, [low], cpus=1)
+    G_inc = ox.elevation.add_node_elevations_raster(G_inc, [high, low], cpus=1)
+    G_scratch = ox.elevation.add_node_elevations_raster(
+        _elevation_test_graph(), [high, low], cpus=1
+    )
+    assert dict(G_inc.nodes(data="elevation")) == dict(G_scratch.nodes(data="elevation"))
+    G_inc = ox.add_edge_grades(G_inc)
+    G_scratch = ox.add_edge_grades(G_scratch)
+    grades_inc = {(u, v, k): grade for u, v, k, grade in G_inc.edges(keys=True, data="grade")}
+    grades_scratch = {
+        (u, v, k): grade for u, v, k, grade in G_scratch.edges(keys=True, data="grade")
+    }
+    assert grades_inc == grades_scratch
+
+    # a revised delivery that loses the valid sample at node 1 must null that
+    # node, clear its provenance, and revoke grade/grade_abs on every edge
+    # touching it; edges elsewhere keep their grades
+    revised = tmp_path / "dem_revised.tif"
+    revised.write_text("revised")
+    _fake_rasterio(monkeypatch, {revised: {(0.0, 0.0): 100.0, (1.0, 0.0): np.nan,
+                                          (2.0, 0.0): 200.0, (3.0, 0.0): 300.0}})
+    G = ox.elevation.add_node_elevations_raster(G, revised, cpus=1)
+    assert pd.isna(G.nodes[1]["elevation"])
+    assert "elevation_src" not in G.nodes[1]
+    G = ox.add_edge_grades(G, add_absolute=True)
+    for edge in [(0, 1, 0), (1, 2, 0), (1, 3, 0)]:
+        assert "grade" not in G.edges[edge]
+        assert "grade_abs" not in G.edges[edge]
+    assert G.edges[(2, 3, 0)]["grade"] == 10.0
+
+    # add_absolute=False revokes every stale grade_abs but leaves grades alone
+    G = ox.add_edge_grades(G, add_absolute=False)
+    assert all("grade_abs" not in d for *_, d in G.edges(keys=True, data=True))
+    assert G.edges[(2, 3, 0)]["grade"] == 10.0
 
 
 @pytest.mark.xdist_group(name="group0")

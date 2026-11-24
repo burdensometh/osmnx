@@ -37,7 +37,6 @@ autodoc_mock_imports = [
     "pandas",
     "rasterio",
     "requests",
-    "rio-vrt",
     "scipy",
     "shapely",
     "sklearn",

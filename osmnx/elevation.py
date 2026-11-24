@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging as lg
 import multiprocessing as mp
 import time
@@ -23,15 +24,18 @@ from ._errors import InsufficientResponseError
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-# rasterio and rio-vrt are optional dependencies for raster querying
+# rasterio is an optional dependency for raster querying
 try:
     import rasterio
 except ImportError:  # pragma: no cover
     rasterio = None
-try:
-    from rio_vrt import build_vrt
-except ImportError:  # pragma: no cover
-    build_vrt = None
+
+# names of the node and graph attributes that record where elevations came from
+ELEVATION_SRC_ATTR = "elevation_src"
+ELEVATION_VERSIONS_ATTR = "elevation_versions"
+
+# how many bytes to read at a time when hashing raster files
+_CHECKSUM_CHUNK_SIZE = 8 * 1024 * 1024
 
 
 def add_edge_grades(G: nx.MultiDiGraph, *, add_absolute: bool = True) -> nx.MultiDiGraph:
@@ -42,6 +46,14 @@ def add_edge_grades(G: nx.MultiDiGraph, *, add_absolute: bool = True) -> nx.Mult
     for each edge in the graph and add it to the edge as an attribute. Nodes
     must already have `elevation` and `length` attributes before using this
     function.
+
+    A grade can only be calculated when both of an edge's endpoint nodes have
+    valid (i.e., not null) `elevation` values. For any edge whose endpoint
+    nodes do not both have valid elevations, any pre-existing `grade` and
+    `grade_abs` attributes are removed instead. Likewise, when `add_absolute`
+    is False, any pre-existing `grade_abs` attributes are removed so the
+    returned graph never retains stale grades that no longer match the current
+    node elevations.
 
     See also the `add_node_elevations_raster` and `add_node_elevations_google`
     functions.
@@ -60,17 +72,48 @@ def add_edge_grades(G: nx.MultiDiGraph, *, add_absolute: bool = True) -> nx.Mult
         edges.
     """
     elev_lookup = G.nodes(data="elevation")
-    u, v, k, lengths = zip(*G.edges(keys=True, data="length"), strict=True)
-    uvk = tuple(zip(u, v, k, strict=True))
+    uvk = tuple(G.edges(keys=True))
+    if not uvk:
+        msg = "Added grade attributes to all edges"
+        utils.log(msg, level=lg.INFO)
+        return G
 
-    # calculate edges' elevation changes from u to v then divide by lengths
-    elevs = np.array([(elev_lookup[u], elev_lookup[v]) for u, v, k in uvk])
-    grades = (elevs[:, 1] - elevs[:, 0]) / np.array(lengths)
-    nx.set_edge_attributes(G, dict(zip(uvk, grades, strict=True)), name="grade")
+    lengths = tuple(G.edges[edge]["length"] for edge in uvk)
 
-    # optionally add grade absolute value to the edge attributes
+    # calculate edges' elevation changes from u to v then divide by lengths;
+    # missing or null node elevations become NaN and invalidate the edge grade
+    elevs = np.array(
+        [
+            [np.nan if elev_lookup[node] is None else elev_lookup[node] for node in edge[:2]]
+            for edge in uvk
+        ],
+        dtype=float,
+    )
+    valid = ~np.isnan(elevs).any(axis=1)
+    grades = np.full(len(uvk), np.nan)
+    grades[valid] = (elevs[valid, 1] - elevs[valid, 0]) / np.array(lengths)[valid]
+
+    # set grades on edges with valid endpoint elevations; revoke stale grades
+    # on edges that lost a valid elevation at either endpoint
+    grades_dict = {
+        edge: grade
+        for edge, grade in zip(uvk, grades, strict=True)
+        if np.isfinite(grade)
+    }
+    nx.set_edge_attributes(G, grades_dict, name="grade")
+
+    # optionally add grade absolute value; always revoke stale grade/grade_abs
+    # attributes on invalid edges so nothing retained contradicts the elevations
+    invalid_edges = [edge for edge, is_valid in zip(uvk, valid, strict=True) if not is_valid]
+    for edge in invalid_edges:
+        G.edges[edge].pop("grade", None)
+        G.edges[edge].pop("grade_abs", None)
     if add_absolute:
-        nx.set_edge_attributes(G, dict(zip(uvk, np.abs(grades), strict=True)), name="grade_abs")
+        grade_abs_dict = {edge: abs(grade) for edge, grade in grades_dict.items()}
+        nx.set_edge_attributes(G, grade_abs_dict, name="grade_abs")
+    else:
+        for edge in uvk:
+            G.edges[edge].pop("grade_abs", None)
 
     msg = "Added grade attributes to all edges"
     utils.log(msg, level=lg.INFO)
@@ -85,13 +128,16 @@ def _query_raster(
     """
     Query a raster file for values at coordinates in DataFrame x/y columns.
 
+    Raster nodata values are returned as `numpy.nan` so they can never
+    overwrite a valid elevation sampled from a higher-priority source.
+
     Parameters
     ----------
     nodes
         DataFrame indexed by node ID and with two columns representing x and y
         coordinates.
     filepath
-        Path to the raster file or VRT to query.
+        Path to the raster file to query.
     band
         Which raster band to query.
 
@@ -102,43 +148,34 @@ def _query_raster(
     """
     # must open raster file here: cannot pickle it to pass in multiprocessing
     with rasterio.open(filepath) as raster:
-        values = np.array(tuple(raster.sample(nodes.to_numpy(), band)), dtype=float).squeeze()
+        values = np.array(tuple(raster.sample(nodes.to_numpy(), band)), dtype=float).reshape(-1)
         values[values == raster.nodata] = np.nan
         return zip(nodes.index, values, strict=True)
 
 
-def _build_vrt_file(raster_paths: Iterable[str | Path]) -> Path:
+def _raster_checksum(filepath: str | Path) -> str:
     """
-    Build a virtual raster file compositing multiple individual raster files.
+    Calculate a SHA-256 checksum of a raster file's contents.
 
-    See also https://gdal.org/en/stable/drivers/raster/vrt.html
+    The checksum identifies the actual file version, so two deliveries of
+    same-named rasters (including a file overwritten in place) are still
+    distinguishable by their content.
 
     Parameters
     ----------
-    raster_paths
-        The paths to the raster files.
+    filepath
+        Path to the raster file to checksum.
 
     Returns
     -------
-    vrt_path
-        The path to the VRT file.
+    checksum
+        The file's hex-encoded SHA-256 digest.
     """
-    if build_vrt is None:  # pragma: no cover
-        msg = "rio-vrt must be installed as an optional dependency to build VRTs."
-        raise ImportError(msg)
-
-    # determine VRT cache filepath, from stringified sorted raster filepaths
-    raster_paths = sorted(raster_paths)
-    vrt_path = _http._resolve_cache_filepath(str(raster_paths), "vrt")
-
-    # build the VRT file if it doesn't already exist in the cache
-    if not vrt_path.is_file():
-        msg = f"Building VRT for {len(raster_paths):,} rasters at {str(vrt_path)!r}..."
-        utils.log(msg, level=lg.INFO)
-        vrt_path.parent.mkdir(parents=True, exist_ok=True)
-        build_vrt(vrt_path, raster_paths)
-
-    return vrt_path
+    digest = hashlib.sha256()
+    with Path(filepath).open("rb") as f:
+        for chunk in iter(lambda: f.read(_CHECKSUM_CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def add_node_elevations_raster(
@@ -151,8 +188,22 @@ def add_node_elevations_raster(
     """
     Add `elevation` attributes to all nodes from local raster file(s).
 
-    If `filepath` is an iterable of paths, this will generate a virtual raster
-    composed of the files at those paths as an intermediate step.
+    If `filepath` is an iterable of paths, they are treated as an ordered
+    sequence of elevation sources in descending priority: the first raster in
+    the sequence that provides a valid sample at a node determines that
+    node's elevation. Nodata pixels and pixels outside a raster's extent never
+    overwrite a valid value, so where a high-priority raster is nodata the
+    node falls back to the next raster that samples it validly. This makes the
+    result reproducible: recomputing from scratch with an ordered list of
+    rasters yields the same node elevations (and therefore the same directed
+    edge grades) as applying successive deliveries incrementally.
+
+    Each node's contributing source is recorded in its `elevation_src`
+    attribute as the source raster's path. A graph-level `elevation_versions`
+    attribute maps each source path to the SHA-256 checksum of the file
+    actually sampled, so elevations can be traced back to the exact file
+    version even when different deliveries share the same filename. Nodes that
+    no raster samples validly receive a null elevation.
 
     See also the `add_edge_grades` function.
 
@@ -161,7 +212,8 @@ def add_node_elevations_raster(
     G
         Graph in same CRS as raster.
     filepath
-        The path(s) to the raster file(s) to query.
+        The path(s) to the raster file(s) to query, ordered from highest to
+        lowest priority.
     band
         Which raster band to query.
     cpus
@@ -178,9 +230,11 @@ def add_node_elevations_raster(
         msg = "rasterio must be installed as an optional dependency to query rasters."
         raise ImportError(msg)
 
-    # if multiple filepaths are passed in, compose them as a virtual raster
-    if not isinstance(filepath, (str, Path)):
-        filepath = _build_vrt_file(filepath)
+    # normalize to an ordered, de-duplicated list of raster file paths
+    if isinstance(filepath, (str, Path)):
+        filepaths = [Path(filepath)]
+    else:
+        filepaths = list(dict.fromkeys(Path(path) for path in filepath))
 
     if cpus is None:
         cpus = mp.cpu_count()
@@ -188,21 +242,95 @@ def add_node_elevations_raster(
     msg = f"Attaching elevations with {cpus} CPUs..."
     utils.log(msg, level=lg.INFO)
 
-    nodes = convert.graph_to_gdfs(G, edges=False, node_geometry=False)[["x", "y"]]
-    if cpus == 1:
-        elevs = dict(_query_raster(nodes, filepath, band))
-    else:
-        # divide nodes into equal-sized chunks for multiprocessing
-        size = int(np.ceil(len(nodes) / cpus))
-        args = ((nodes.iloc[i : i + size], filepath, band) for i in range(0, len(nodes), size))
-        with mp.get_context().Pool(cpus) as pool:
-            results = pool.starmap_async(_query_raster, args).get()
-        elevs = {k: v for kv in results for k, v in kv}
+    # record the checksum of every sampled file so each elevation can be
+    # traced to the exact file version, including same-named deliveries
+    versions = {str(path): _raster_checksum(path) for path in filepaths}
 
-    nx.set_node_attributes(G, elevs, name="elevation")
+    nodes = convert.graph_to_gdfs(G, edges=False, node_geometry=False)[["x", "y"]]
+
+    # sample every source at every node (serially or in chunks across a
+    # process pool), then merge the samples in priority order so each node
+    # keeps the first valid value and falls back past nodata samples
+    tasks = [(nodes, path) for path in filepaths]
+    sampled = _sample_tasks(tasks, band, cpus)
+    elevations = pd.Series(np.nan, index=nodes.index, dtype=float)
+    sources = pd.Series(np.nan, index=nodes.index, dtype=object)
+    for path, values in zip(filepaths, sampled, strict=True):
+        for node_id, value in values.items():
+            if pd.isna(elevations.loc[node_id]) and pd.notna(value):
+                elevations.loc[node_id] = value
+                sources.loc[node_id] = str(path)
+
+    # null elevations mark nodes that no source sampled validly; their source
+    # is left unset so nothing claims a nodata delivery. Remove any pre-existing
+    # provenance first so nodes that lost their valid sample don't keep stale
+    # source claims from an earlier delivery.
+    for node_data in G.nodes(data=False):
+        G.nodes[node_data].pop(ELEVATION_SRC_ATTR, None)
+    nx.set_node_attributes(G, elevations.to_dict(), name="elevation")
+    nx.set_node_attributes(G, sources.dropna().to_dict(), name=ELEVATION_SRC_ATTR)
+    G.graph[ELEVATION_VERSIONS_ATTR] = versions
+
     msg = "Added elevation data from raster to all nodes"
     utils.log(msg, level=lg.INFO)
     return G
+
+
+def _sample_tasks(
+    tasks: list[tuple[pd.DataFrame, Path]],
+    band: int,
+    cpus: int,
+) -> list[dict[int, float]]:
+    """
+    Sample each task's nodes from its raster file.
+
+    With one CPU each task is queried directly. With multiple CPUs every
+    task's nodes are split into equal-sized chunks and all chunks are sampled
+    in a single process pool.
+
+    Parameters
+    ----------
+    tasks
+        Ordered list of (nodes DataFrame, raster path) sampling tasks.
+    band
+        Which raster band to query.
+    cpus
+        How many CPU cores to use if multiprocessing.
+
+    Returns
+    -------
+    sampled
+        For each task, a dict of node ID to sampled value (nodata becomes
+        `numpy.nan`), in the same order as `tasks`.
+    """
+    if cpus == 1:
+        return [dict(_query_raster(task_nodes, path, band)) for task_nodes, path in tasks]
+
+    chunked: list[tuple[pd.DataFrame, Path, int]] = []
+    chunk_counts = []
+    for task_nodes, path in tasks:
+        size = max(int(np.ceil(len(task_nodes) / cpus)), 1)
+        starts = range(0, len(task_nodes), size)
+        chunk_counts.append(len(starts))
+        for i in starts:
+            chunked.append((task_nodes.iloc[i : i + size], path, band))
+
+    # nothing to sample (e.g., an empty graph): skip spinning up a process pool
+    if not chunked:
+        return [{} for _ in tasks]
+
+    with mp.get_context().Pool(cpus) as pool:
+        results = pool.starmap_async(_query_raster, chunked).get()
+
+    # recombine each task's chunks back into a single dict
+    sampled: list[dict[int, float]] = []
+    result_iter = iter(results)
+    for n_chunks in chunk_counts:
+        values: dict[int, float] = {}
+        for _ in range(n_chunks):
+            values.update(next(result_iter))
+        sampled.append(values)
+    return sampled
 
 
 def add_node_elevations_google(

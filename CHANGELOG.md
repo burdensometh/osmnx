@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- merge multiple raster elevation sources by ordered priority, keeping only valid samples and falling back past nodata pixels
+- record each node's elevation source (`elevation_src`) and graph-level raster file checksums (`elevation_versions`) for provenance
+- revoke stale edge `grade` and `grade_abs` attributes when either endpoint loses a valid elevation
+- replace rio-vrt optional dependency with in-Python priority merging of raster files
+
 ## 2.2.0 (2026-11-18)
 
 - add Python 3.15 support and drop Python 3.11 support (#1416)
