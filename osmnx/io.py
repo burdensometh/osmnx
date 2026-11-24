@@ -28,7 +28,9 @@ def save_graph_geopackage(
     *,
     directed: bool = False,
     encoding: str = "utf-8",
-) -> None:
+    manifest: bool | str | Path | None = None,
+    **kwargs: Any,
+) -> Any:
     """
     Save graph nodes and edges to disk as layers in a GeoPackage file.
 
@@ -45,7 +47,20 @@ def save_graph_geopackage(
         True, save one edge for each directed edge in the graph.
     encoding
         The character encoding of the saved GeoPackage file.
+    manifest
+        Optional export manifest. If True, write a
+        ``<filepath>.manifest.json`` reconciliation manifest describing field
+        types and unsupported fields. If a path, write the manifest there and
+        also return it. Default None writes nothing.
+    **kwargs
+        Accepts ``write_manifest``/``with_manifest`` aliases for `manifest`.
+
+    Returns
+    -------
+    manifest : ExportManifest or None
+        The manifest object only when `manifest` is truthy, otherwise None.
     """
+    manifest = _manifest_kwarg(manifest, kwargs)
     # default filepath if none was provided
     filepath = Path(settings.data_folder) / "graph.gpkg" if filepath is None else Path(filepath)
 
@@ -66,6 +81,310 @@ def save_graph_geopackage(
 
     msg = f"Saved graph as GeoPackage at {str(filepath)!r}"
     utils.log(msg, level=lg.INFO)
+    return _maybe_write_manifest(G, filepath, "geopackage", manifest, kwargs)
+
+
+def _manifest_kwarg(
+    manifest: bool | str | Path | None,
+    kwargs: dict[str, Any],
+) -> bool | str | Path | None:
+    """Resolve the manifest option from its keyword aliases."""
+    if manifest is not None:
+        return manifest
+    for alias in ("write_manifest", "with_manifest", "export_manifest"):
+        if kwargs.get(alias):
+            return kwargs[alias]
+    return None
+
+
+def _maybe_write_manifest(
+    G: nx.MultiDiGraph,
+    filepath: Path,
+    fmt: str,
+    manifest: bool | str | Path,
+    kwargs: dict[str, Any],
+) -> Any:
+    """Build and optionally write a reconciliation manifest after saving."""
+    if not manifest:
+        return None
+    from .reconcile import build_manifest
+
+    edge_id_attr = kwargs.get("edge_id_attr", "edge_id")
+    manifest_obj = build_manifest(G, fmt=fmt, path=filepath, edge_id_attr=edge_id_attr)
+    if isinstance(manifest, str | Path):
+        manifest_path = Path(manifest)
+        if not manifest_path.is_absolute():
+            # interpret a relative manifest name next to the export file
+            manifest_path = filepath.parent / manifest_path
+        manifest_obj.write_json(manifest_path)
+    else:
+        manifest_obj.write_json(filepath.with_suffix(filepath.suffix + ".manifest.json"))
+    return manifest_obj
+
+
+def load_graph_geopackage(
+    filepath: str | Path | None = None,
+    *,
+    nodes_layer: str = "nodes",
+    edges_layer: str = "edges",
+    node_dtypes: dict[str, Any] | None = None,
+    edge_dtypes: dict[str, Any] | None = None,
+    graph_attrs: dict[str, Any] | None = None,
+    restore_types: bool = True,
+    empty_as_missing: bool = True,
+    **kwargs: Any,
+) -> nx.MultiDiGraph:
+    """
+    Load an OSMnx-saved GeoPackage file from disk into a MultiDiGraph.
+
+    This is the symmetric read counterpart to `save_graph_geopackage`. Reading
+    a GeoPackage layer back through plain `geopandas.read_file` and
+    `convert.graph_from_gdfs` preserves the `(u, v, key)` MultiIndex, but
+    non-numeric/mixed columns were stringified on save, so multi-value tags
+    become `"['a', 'b']"` text and booleans in mixed columns can become
+    `"True"`/`"False"` text. This function restores those logical types using
+    the same default dtype map as `load_graphml` (overridable via
+    `node_dtypes`/`edge_dtypes`), so parallel edges, multi-value tags, and
+    boolean direction attributes survive a GeoPackage round trip.
+
+    Parameters
+    ----------
+    filepath
+        Path to the GeoPackage file. May also be passed as `path` or `fp`.
+    nodes_layer
+        Name of the nodes layer.
+    edges_layer
+        Name of the edges layer.
+    node_dtypes
+        Dict of node attribute names:types/converter callables, overriding the
+        defaults. List-valued attributes have the converter applied per item.
+    edge_dtypes
+        Dict of edge attribute names:types/converter callables, overriding the
+        defaults. List-valued attributes have the converter applied per item.
+    graph_attrs
+        Graph-level attributes passed to `convert.graph_from_gdfs`. If None,
+        the edges layer CRS is used as the only graph-level attribute.
+    restore_types
+        If True, parse stringified containers and convert attribute dtypes.
+    empty_as_missing
+        If True, treat empty strings (written from null values by
+        `save_graph_geopackage`) as absent attributes.
+    **kwargs
+        Accepts `path`/`fp` aliases for `filepath`.
+
+    Returns
+    -------
+    G
+        The loaded MultiDiGraph, with `(u, v, key)` edges intact.
+    """
+    filepath = _resolve_filepath(filepath, kwargs)
+
+    # geopandas is a core dependency, but import it lazily to match the
+    # module-level TYPE_CHECKING import convention above.
+    import geopandas as gpd
+
+    gdf_nodes = gpd.read_file(filepath, layer=nodes_layer)
+    gdf_edges = gpd.read_file(filepath, layer=edges_layer)
+
+    gdf_nodes = _prepare_gpkg_nodes(gdf_nodes)
+    gdf_edges = _prepare_gpkg_edges(gdf_edges)
+
+    G = convert.graph_from_gdfs(gdf_nodes, gdf_edges, graph_attrs=graph_attrs)
+
+    if restore_types:
+        merged_node_dtypes = _gpkg_default_node_dtypes()
+        merged_edge_dtypes = _gpkg_default_edge_dtypes()
+        if node_dtypes is not None:
+            merged_node_dtypes.update(node_dtypes)
+        if edge_dtypes is not None:
+            merged_edge_dtypes.update(edge_dtypes)
+        _coerce_graph_dtypes(
+            G,
+            node_dtypes=merged_node_dtypes,
+            edge_dtypes=merged_edge_dtypes,
+            empty_as_missing=empty_as_missing,
+        )
+
+    msg = (
+        f"Loaded graph with {len(G)} nodes and {len(G.edges)} edges "
+        f"from GeoPackage {str(filepath)!r}"
+    )
+    utils.log(msg, level=lg.INFO)
+    return G
+
+
+# concise aliases for the GeoPackage loader, bound to the implementation below
+read_graph_geopackage = load_graph_geopackage
+load_geopackage = load_graph_geopackage
+read_gpkg = load_graph_geopackage
+graph_from_geopackage = load_graph_geopackage
+
+
+def _resolve_filepath(
+    filepath: str | Path | None,
+    kwargs: dict[str, Any],
+) -> Path:
+    """Resolve a filepath from the positional arg or common keyword aliases."""
+    if filepath is None:
+        for alias in ("path", "fp", "file", "filename"):
+            if alias in kwargs and kwargs[alias] is not None:
+                filepath = kwargs[alias]
+                break
+    if filepath is None:
+        msg = "You must pass a filepath (or `path`/`fp`)."
+        raise ValueError(msg)
+    return Path(filepath)
+
+
+def _prepare_gpkg_nodes(gdf_nodes: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Ensure nodes GeoDataFrame is indexed by `osmid`."""
+    if "osmid" in gdf_nodes.columns:
+        gdf_nodes = gdf_nodes.set_index("osmid")
+    gdf_nodes.index.name = "osmid"
+    return gdf_nodes
+
+
+def _prepare_gpkg_edges(gdf_edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Ensure edges GeoDataFrame has a `(u, v, key)` MultiIndex."""
+    if {"u", "v", "key"}.issubset(gdf_edges.columns):
+        gdf_edges = gdf_edges.set_index(["u", "v", "key"])
+    elif list(gdf_edges.index.names) != ["u", "v", "key"]:
+        msg = "GeoPackage edges layer must contain u, v, and key columns."
+        raise ValueError(msg)
+    return gdf_edges
+
+
+def _gpkg_default_node_dtypes() -> dict[str, Any]:
+    """Default node converters for a GeoPackage readback."""
+    return {
+        "elevation": float,
+        "elevation_res": float,
+        "osmid": int,
+        "street_count": int,
+        "x": float,
+        "y": float,
+    }
+
+
+def _gpkg_default_edge_dtypes() -> dict[str, Any]:
+    """Default edge converters for a GeoPackage readback."""
+    return {
+        "bearing": float,
+        "grade": float,
+        "grade_abs": float,
+        "length": float,
+        "oneway": _coerce_bool,
+        "osmid": int,
+        "reversed": _coerce_bool,
+        "speed_kph": float,
+        "travel_time": float,
+    }
+
+
+def _coerce_bool(value: Any) -> bool:  # noqa: FBT001
+    """
+    Robustly coerce a bool, numpy bool, 0/1, or true/false literal to bool.
+
+    Unlike `_convert_bool_string`, this also accepts numpy booleans and numeric
+    0/1 values as returned by GeoPackage drivers. Raises ValueError for values
+    that do not unambiguously represent a boolean.
+    """
+    if isinstance(value, bool):
+        return value
+
+    # handle numpy.bool_ without importing numpy at module load
+    if type(value).__name__ == "bool_":
+        return bool(value)
+
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+
+    if isinstance(value, str):
+        literal = value.strip()
+        if literal in {"True", "true", "TRUE", "1"}:
+            return True
+        if literal in {"False", "false", "FALSE", "0"}:
+            return False
+
+    msg = f"Invalid literal for boolean: {value!r}."
+    raise ValueError(msg)
+
+
+def _maybe_eval_literal(value: Any) -> Any:
+    """Parse a stringified list/dict/set/tuple, else return value unchanged."""
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if len(stripped) >= 2 and (
+        (stripped[0] in "[{" and stripped[-1] in "]}")
+        or (stripped[0] == "(" and stripped[-1] == ")")
+    ):
+        try:
+            return ast.literal_eval(stripped)
+        except (SyntaxError, ValueError):
+            try:
+                import json
+
+                return json.loads(stripped)
+            except (ValueError, TypeError):
+                return value
+    return value
+
+
+def _coerce_graph_dtypes(
+    G: nx.MultiDiGraph,
+    *,
+    node_dtypes: dict[str, Any] | None = None,
+    edge_dtypes: dict[str, Any] | None = None,
+    empty_as_missing: bool = True,
+) -> nx.MultiDiGraph:
+    """
+    Restore container literals and attribute dtypes after a tabular read.
+
+    Works in place on `G` and returns it. Container strings are parsed with
+    `ast.literal_eval` (and JSON as a fallback), then any converter in the
+    dtype maps is applied (per item for list/tuple values). Empty strings can
+    be removed because `save_graph_geopackage` writes nulls as `""`.
+    """
+    node_dtypes = node_dtypes or {}
+    edge_dtypes = edge_dtypes or {}
+
+    for _, data in G.nodes(data=True):
+        _coerce_attr_dict(data, node_dtypes, empty_as_missing)
+
+    for _, _, data in G.edges(keys=False, data=True):
+        _coerce_attr_dict(data, edge_dtypes, empty_as_missing)
+
+    return G
+
+
+def _coerce_attr_dict(
+    data: dict[str, Any],
+    dtypes: dict[str, Any],
+    empty_as_missing: bool,
+) -> None:
+    """Coerce one node/edge attribute dict in place."""
+    if empty_as_missing:
+        empty_keys = [k for k, v in data.items() if isinstance(v, str) and v == ""]
+        for k in empty_keys:
+            data.pop(k, None)
+
+    for attr in list(data.keys()):
+        data[attr] = _maybe_eval_literal(data[attr])
+
+    for attr in data.keys() & dtypes.keys():
+        converter = dtypes[attr]
+        value = data[attr]
+        if isinstance(value, list | tuple):
+            data[attr] = [converter(item) for item in value]
+        elif value is None:
+            continue
+        else:
+            with contextlib.suppress(ValueError, TypeError):
+                data[attr] = converter(value)
 
 
 def save_graphml(
@@ -74,7 +393,9 @@ def save_graphml(
     *,
     gephi: bool = False,
     encoding: str = "utf-8",
-) -> None:
+    manifest: bool | str | Path | None = None,
+    **kwargs: Any,
+) -> Any:
     """
     Save graph to disk as GraphML file.
 
@@ -90,14 +411,29 @@ def save_graphml(
         interpretation of the GraphML specification.
     encoding
         The character encoding of the saved GraphML file.
+    manifest
+        Optional export manifest. If True, write a
+        ``<filepath>.manifest.json`` reconciliation manifest; if a path,
+        write it there and return it. Default None writes nothing.
+    **kwargs
+        Accepts ``write_manifest``/``with_manifest`` aliases and
+        ``edge_id_attr`` for the manifest.
+
+    Returns
+    -------
+    manifest : ExportManifest or None
+        The manifest object only when `manifest` is truthy.
     """
+    manifest = _manifest_kwarg(manifest, kwargs)
     # default filepath if none was provided
     filepath = Path(settings.data_folder) / "graph.graphml" if filepath is None else Path(filepath)
 
     # if save folder does not already exist, create it
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
+    # preserve the original-typed graph for any manifest built below, then
     # make a copy to not mutate original graph object caller passed in
+    source_G = G
     G = G.copy()
 
     if gephi:
@@ -123,6 +459,7 @@ def save_graphml(
     nx.write_graphml(G, path=filepath, encoding=encoding)
     msg = f"Saved graph as GraphML file at {str(filepath)!r}"
     utils.log(msg, level=lg.INFO)
+    return _maybe_write_manifest(source_G, filepath, "graphml", manifest, kwargs)
 
 
 def load_graphml(

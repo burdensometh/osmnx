@@ -85,6 +85,14 @@ osmnx.projection module
 .. automodule:: osmnx.projection
     :members:
 
+.. _osmnx-reconcile-module:
+
+osmnx.reconcile module
+----------------------
+
+.. automodule:: osmnx.reconcile
+    :members:
+
 .. _osmnx-routing-module:
 
 osmnx.routing module
