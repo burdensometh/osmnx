@@ -26,8 +26,11 @@ import pandas as pd
 import pytest
 from lxml import etree
 from requests.exceptions import ConnectionError as RequestsConnectionError
+from shapely import LineString
+from shapely import MultiPolygon
 from shapely import Point
 from shapely import Polygon
+from shapely import box
 from shapely import wkt
 from typeguard import suppress_type_checks
 
@@ -300,6 +303,94 @@ def test_simplify_graph() -> None:
     G.nodes[2]["highway"] = "crossing"
     Gs = ox.simplify_graph(G, node_attrs_include=["highway"])
     assert set(Gs.nodes) == {1, 2, 3}
+
+
+def test_clip_graph() -> None:
+    """Test clipping graph edge geometries to polygons and bounding boxes."""
+    # build a small geographic graph with one edge that passes through the
+    # clipping area but has both endpoints outside it
+    G = nx.MultiDiGraph(crs="epsg:4326")
+    G.add_node(1, x=0, y=0, street_count=1)
+    G.add_node(2, x=10, y=10, street_count=1)
+    G.add_edge(1, 2, osmid=1, length=1.0, geometry=LineString([(0, 0), (10, 10)]))
+    polygon = box(3, 3, 7, 7)
+
+    # node-based truncation cannot retain this pass-through edge...
+    with pytest.raises(ValueError, match="no graph nodes", strict=True):
+        ox.truncate.truncate_graph_polygon(G, polygon)
+
+    # ...but geometry-based clipping retains it, split at the boundary
+    Gc = ox.truncate.clip_graph_polygon(G, polygon)
+    assert len(Gc.edges) == 1
+    u, v, _k, data = next(iter(Gc.edges(keys=True, data=True)))
+    assert list(data["geometry"].coords) == [(3.0, 3.0), (7.0, 7.0)]
+    assert (Gc.nodes[u]["x"], Gc.nodes[u]["y"]) == (3.0, 3.0)
+    assert (Gc.nodes[v]["x"], Gc.nodes[v]["y"]) == (7.0, 7.0)
+    assert Gc.nodes[u]["clipped"] is True
+    assert Gc.nodes[v]["clipped"] is True
+    assert 1 not in Gc.nodes and 2 not in Gc.nodes
+    expected_len = ox.distance.great_circle(3, 3, 7, 7)
+    assert data["length"] == pytest.approx(expected_len)
+    ox.convert.validate_graph(Gc)
+
+    # direction must be preserved for a reversed edge
+    Gr = nx.MultiDiGraph(crs="epsg:4326")
+    Gr.add_node(5, x=10, y=10, street_count=1)
+    Gr.add_node(6, x=0, y=0, street_count=1)
+    Gr.add_edge(5, 6, osmid=1, length=1.0, geometry=LineString([(10, 10), (0, 0)]))
+    Grc = ox.truncate.clip_graph_polygon(Gr, polygon)
+    _, _, _, data_r = next(iter(Grc.edges(keys=True, data=True)))
+    assert list(data_r["geometry"].coords) == [(7.0, 7.0), (3.0, 3.0)]
+
+    # MultiPolygon: an edge weaving in and out yields one segment per part
+    Gm = nx.MultiDiGraph(crs="epsg:4326")
+    Gm.add_node(1, x=0, y=0, street_count=1)
+    Gm.add_node(2, x=10, y=10, street_count=1)
+    Gm.add_edge(1, 2, osmid=1, length=1.0, geometry=LineString([(0, 0), (10, 10)]))
+    multipolygon = MultiPolygon([box(1, 1, 2, 2), box(8, 8, 9, 9)])
+    Gmc = ox.truncate.clip_graph_polygon(Gm, multipolygon)
+    assert len(Gmc.edges) == 2
+    assert len(Gmc.nodes) == 4
+    assert all(d.get("clipped") for _, d in Gmc.nodes(data=True))
+
+    # boundary tangency at a point only is discarded; the whole graph is
+    # disjoint from the polygon's interior so clipping raises
+    Gt = nx.MultiDiGraph(crs="epsg:4326")
+    Gt.add_node(1, x=0, y=0, street_count=1)
+    Gt.add_node(2, x=10, y=0, street_count=1)
+    Gt.add_edge(1, 2, osmid=1, length=1.0, geometry=LineString([(0, 0), (5, 3), (10, 0)]))
+    with pytest.raises(ValueError, match="no graph edges", strict=True):
+        ox.truncate.clip_graph_polygon(Gt, polygon)
+
+    # an edge without a geometry attribute is reconstructed as a straight line
+    Gn = nx.MultiDiGraph(crs="epsg:4326")
+    Gn.add_node(1, x=0, y=0, street_count=1)
+    Gn.add_node(2, x=10, y=10, street_count=1)
+    Gn.add_edge(1, 2, osmid=1, length=42.0)
+    Gnc = ox.truncate.clip_graph_polygon(Gn, polygon)
+    _, _, _, data_n = next(iter(Gnc.edges(keys=True, data=True)))
+    assert list(data_n["geometry"].coords) == [(3.0, 3.0), (7.0, 7.0)]
+    assert data_n["length"] != 42.0
+
+    # projected graphs take lengths directly from the clipped geometry
+    Gp = nx.MultiDiGraph(crs="epsg:3857")
+    Gp.add_node(1, x=0, y=0, street_count=1)
+    Gp.add_node(2, x=100, y=0, street_count=1)
+    Gp.add_edge(1, 2, osmid=1, length=100.0, geometry=LineString([(0, 0), (100, 0)]))
+    Gpc = ox.truncate.clip_graph_polygon(Gp, box(20, -10, 80, 10))
+    _, _, _, data_p = next(iter(Gpc.edges(keys=True, data=True)))
+    assert data_p["length"] == pytest.approx(60.0)
+
+    # bbox wrapper produces identical clipped geometry, and the original
+    # graph is never mutated
+    Gbc = ox.truncate.clip_graph_bbox(G, (3, 3, 7, 7))
+    _, _, _, data_b = next(iter(Gbc.edges(keys=True, data=True)))
+    assert list(data_b["geometry"].coords) == [(3.0, 3.0), (7.0, 7.0)]
+    assert len(G.nodes) == 2 and len(G.edges) == 1
+
+    # invalid input geometries raise
+    with pytest.raises(TypeError, strict=True):
+        ox.truncate.clip_graph_polygon(G, LineString([(0, 0), (1, 1)]))
 
 
 @pytest.mark.xdist_group(name="group1")

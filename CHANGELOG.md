@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- add `truncate.clip_graph_polygon` and `truncate.clip_graph_bbox` to clip edge geometries by polygon/bbox, retaining roads that pass through the area even when both endpoints lie outside it, splitting them at the boundary into reviewable synthetic boundary nodes with corrected meter lengths and preserved direction
+
 ## 2.2.0 (2026-11-18)
 
 - add Python 3.15 support and drop Python 3.11 support (#1416)
